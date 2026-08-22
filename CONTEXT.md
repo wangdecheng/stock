@@ -73,3 +73,33 @@ _Avoid_: service down(语义太宽)
 **UnknownSymbolError**:
 任何 backend 都无法识别该 symbol。**不**走 fallback、不读缓存。
 _Avoid_: invalid symbol、bad symbol
+
+### 策略层
+
+**StateMachine**:
+本策略的 **4-regime 分类器**(TREND_UP / TREND_DOWN / RANGE_BULL / RANGE_BEAR)。按当日 ADX、+DI/-DI、MA20/MA60 的条件把市场归到 4 个状态之一。**不是**通用 FSM —— 状态集、转移条件、默认权重都是本策略固定的。
+_Avoid_: FSM、state machine(太泛)、classifier、regime model
+
+**TrendState**:
+StateMachine 的**枚举输出域**:`{TREND_UP, TREND_DOWN, RANGE_BULL, RANGE_BEAR}`。每根 bar 输出**唯一**一个值;持久化键 `current_state` 与 `pending_state` 都用这个枚举的字符串。
+_Avoid_: regime、state(歧义)、market state、regime enum
+
+**Hysteresis Gate**:
+进入 TREND_UP 前的**确认门槛**:ADX > 25 且 ADX 连续 2 日上升 且 Close > BB mid,三者**连续 2 个 bar** 同时成立才放行。专门过滤单日 ADX 抖动引发的假突破。持久化键 `pending_state` + `pending_days` 用来计数。
+_Avoid_: confirmation、debounce、entry filter、ADX filter
+
+**Phased Exit**:
+离开任一持仓状态时,目标权重走 **N 日线性**(默认 2 日)到新 default。第 1 天走一半、第 2 天走完。比瞬时全卖降低"踩在反转日谷底"的风险。持久化键 `exit_in_progress = {target, days_left}`。
+_Avoid_: gradual exit、ladder exit、scaled exit、drip exit
+
+**HalvedStage**:
+TREND_UP **内部**的三段子状态:`full → halved → cleared`。`full` 时 Close < MA20 → `halved`(权重 0.50);`halved` 时 Close < MA10 → `cleared`(权重 0.00)。允许趋势中段一次 MA20 抖动不直接清仓。持久化键 `trend_up_stage`。
+_Avoid_: stop stage、position stage、trailing stage、internal state
+
+**Signal Modulator**:
+RANGE_BULL 买入信号叠加的 **0–1 连续标量**:`weight = 0.50 + 0.5 * clamp((30 - RSI) / 10, 0, 1)`。RSI 越极端(< 20 → 1.0, ≥ 30 → 0.0)加仓越多;**不阻塞**弱信号(只增不减)。
+_Avoid_: RSI multiplier、position scaler、weight adjuster、signal weight
+
+**Adaptive Trigger**:
+RANGE_BULL 的**多源买入触发器**,三选一即触发:BB 下轨触碰 / 长下影线(`(Close - Low) > 2 * |Close - Open|`) / 看涨吞没。卖出触发**只看** BB 上轨触碰(单一源)。比单指标更稳定。
+_Avoid_: entry signal、buy trigger(歧义)、composite signal、multi-signal
