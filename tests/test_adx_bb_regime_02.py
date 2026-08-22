@@ -185,9 +185,18 @@ def test_state_keys_not_clobbered_on_second_run():
     """A second ``generate()`` call against a pre-populated ``ctx.state``
     (as if loaded from ``strategies/adx_bb_regime.state.json``) must
     preserve the user-edited values — ``setdefault`` only writes when
-    the key is absent. ``current_state`` is the only key the strategy
-    legitimately overwrites each bar (it is the *result* of
-    classification, not a user input)."""
+    the key is absent. ``current_state`` is the only "classification
+    result" key the strategy legitimately overwrites each bar.
+
+    Note (T05): ``exit_in_progress`` is *also* legitimately overwritten
+    — T05's Phased Exit logic processes the in-progress phase-out on
+    every bar where the dict is not ``None`` (interpolate, decrement
+    ``days_left``, clear when it hits 0 — D4 / spec T05). On this bar
+    ``prev_state == new_state == TREND_UP`` (no transition), so the
+    transition rule does not fire; however the interpolation still
+    applies because the pre-set dict is non-``None``. With
+    ``days_left = 1`` the interpolation emits the no-op weight 0.5
+    (target == prev_weight) and then clears the dict."""
     from strategies.adx_bb_regime import AdxBbRegimeStrategy
 
     pre = {
@@ -201,11 +210,14 @@ def test_state_keys_not_clobbered_on_second_run():
 
     AdxBbRegimeStrategy().generate(ctx)
 
-    # User-edited values must be preserved verbatim.
+    # User-edited values that are not actively managed by the strategy
+    # on this bar must be preserved verbatim by ``setdefault``.
     assert ctx.state["pending_state"] == "RANGE_BULL"
     assert ctx.state["pending_days"] == 3
     assert ctx.state["trend_up_stage"] == "halved"
-    assert ctx.state["exit_in_progress"] == {"target": 0.5, "days_left": 1}
+    # ``exit_in_progress`` is actively managed by T05: the pre-set
+    # dict had ``days_left = 1`` and T05's interpolation cleared it.
+    assert ctx.state["exit_in_progress"] is None
     # ``current_state`` is rewritten each bar — on the rising series it
     # still classifies as TREND_UP, but the assertion is that the
     # strategy *did* write it (not that setdefault protected it).

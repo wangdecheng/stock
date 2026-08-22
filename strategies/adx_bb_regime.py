@@ -5,9 +5,9 @@ Spec reference: ``.scratch/adx-bb-regime/spec.md`` (D3 / D4 / D5 / D8 / D9).
 This file implements the full four-regime StateMachine (TREND_UP /
 TREND_DOWN / RANGE_BULL / RANGE_BEAR), the Hysteresis Gate from D3/D4
 (a 2-day confirmation that ADX is in a TREND_UP configuration before the
-strategy actually enters that state), and the HalvedStage internal
-trailing stop from D3 / T04. Phased exit (T05) and the Range_Bull signal
-stack (T06) are out of scope here.
+strategy actually enters that state), the HalvedStage internal
+trailing stop from D3 / T04, and the Phased Exit mechanic from D4 / T05.
+The Range_Bull signal stack (T06) is out of scope here.
 
 State persistence follows D5: five keys are populated on first run via
 ``ctx.state.setdefault(...)`` so pre-existing values (e.g. from a hand-
@@ -43,6 +43,34 @@ Re-entering TREND_UP from any other state resets ``trend_up_stage`` to
 ``"full"`` so a fresh trend gets the full two-stage stop again. The
 Close-vs-MA breaches use **strict** ``<`` so Close == MA20 is *not* a
 trigger.
+
+Phased Exit (T05)
+-----------------
+D4 pins entry as *instant* (engine fills at next-day open) and exit as
+*phased* — when ``current_state`` differs from yesterday's AND
+yesterday's state was held (TREND_UP or RANGE_BULL — the two states
+whose default weight is non-zero), the strategy walks toward the new
+default over ``exit_phased_days`` bars (default 2) rather than
+rebalancing in one bar.
+
+Mechanically: ``ctx.state["exit_in_progress"]`` is either ``None`` or
+a JSON-serializable ``{"target": float, "days_left": int}``. On every
+bar, if the previous bar's state was held AND it differs from today's
+classification, the dict is (re)written with ``target = today's natural
+weight`` and ``days_left = exit_phased_days``. If the dict is present
+(from this bar or an earlier one), the strategy emits
+
+    weight = prev_weight + (target - prev_weight) / days_left
+
+where ``prev_weight`` is yesterday's natural weight (HalvedStage-
+derived for TREND_UP, 0.5 for RANGE_BULL, 0.0 otherwise). After
+emitting, ``days_left`` is decremented; when it reaches 0 the dict is
+cleared.
+
+Mid-exit reversals — e.g. ``TREND_UP → RANGE_BULL → TREND_UP`` where
+the second transition fires while ``exit_in_progress`` is still active —
+overwrite the dict with the new destination and reset ``days_left``.
+The strategy does NOT try to "undo" a partial exit.
 """
 
 from __future__ import annotations
@@ -75,10 +103,11 @@ class AdxBbRegimeStrategy:
         hysteresis_days: int = 2,
         exit_phased_days: int = 2,
     ) -> None:
-        # ``rsi_len`` and ``exit_phased_days`` are not yet read — they
-        # are accepted now so the UI form binds cleanly and later
-        # tickets (Range_Bull signal stack, phased exit) can use them
-        # without changing the constructor signature.
+        # ``rsi_len`` is reserved for T06 (Range_Bull signal stack) — it
+        # is accepted now so the UI form binds cleanly without needing a
+        # constructor signature change later. ``exit_phased_days`` is
+        # used by T05's Phased Exit (number of bars over which to walk
+        # toward a new state's default weight).
         self.adx_len = adx_len
         self.bb_len = bb_len
         self.bb_std = bb_std
@@ -99,11 +128,19 @@ class AdxBbRegimeStrategy:
         ctx.state.setdefault("trend_up_stage", "full")
         ctx.state.setdefault("exit_in_progress", None)
 
-        # Capture the previous bar's state for T04's re-entry detection.
-        # ``ctx.state["current_state"]`` is the LAST bar's state (set at
-        # the bottom of this method), so this is what was active before
-        # today's classification.
+        # Capture the previous bar's state for T04's re-entry detection
+        # AND T05's phase-out interpolation. ``ctx.state["current_state"]``
+        # is the LAST bar's state (set at the bottom of this method),
+        # so this is what was active before today's classification.
         prev_state = ctx.state["current_state"]
+        # The natural weight the strategy was emitting on the previous
+        # bar — i.e. the starting point of T05's linear ramp toward
+        # ``exit_in_progress["target"]``. Captured BEFORE T04 modifies
+        # ``trend_up_stage`` so it reflects yesterday's stage, not
+        # today's.
+        prev_weight = self._prev_state_weight(
+            prev_state, ctx.state["trend_up_stage"]
+        )
 
         # Universe is exactly one symbol per D2. ``ctx.universe[0]`` is
         # the contract.
@@ -217,6 +254,73 @@ class AdxBbRegimeStrategy:
                     # 0.0 and stage is unchanged.
                     weight = 0.0
 
+        # ----- T05: Phased Exit -----------------------------------------
+        # D4's entry-asymmetry rule: leaving a held state is *phased*
+        # (2-bar linear sell) while entering is *instant*. Held states
+        # are TREND_UP and RANGE_BULL — the two states whose default
+        # weight is non-zero per D3. We detect the phase-out in two
+        # flavors and combine them into a single rule:
+        #
+        #   1. **Initial exit** (sell-down): ``prev_state`` was held,
+        #      ``prev_state != new_state``, AND today's natural weight
+        #      is *lower* than ``prev_weight``. We are shrinking the
+        #      position — phase it out. Buy-ups (e.g. RANGE_BULL 0.5 →
+        #      TREND_UP 1.0) stay instant: the new held-state entry is
+        #      single-bar, no phasing.
+        #
+        #   2. **Mid-exit reversal** (destination change while phasing):
+        #      ``prev_state`` was held, ``prev_state != new_state``, AND
+        #      ``exit_in_progress`` is already active. The new held-
+        #      state entry / non-held-state exit OVERWRITES the in-
+        #      progress phase-out with the new destination and resets
+        #      ``days_left``. Per D4 the strategy does NOT try to "undo"
+        #      a partial exit — it just aims the ramp at a new target.
+        #
+        # The combined predicate is
+        # ``prev_was_held and prev_state != new_state and
+        # (prev_exit_info is not None or weight < prev_weight)`` —
+        # firing on either an initial sell-down or any flip while a
+        # phase-out is already running.
+        held_states = {"TREND_UP", "RANGE_BULL"}
+        prev_was_held = prev_state in held_states
+        prev_exit_info = ctx.state["exit_in_progress"]
+        if (
+            prev_was_held
+            and prev_state != new_state
+            and (prev_exit_info is not None or weight < prev_weight)
+        ):
+            ctx.state["exit_in_progress"] = {
+                "target": weight,
+                "days_left": self.exit_phased_days,
+            }
+
+        # Apply the linear interpolation toward ``target``. We use
+        # ``prev_weight`` (captured at the top, BEFORE T04 modified
+        # ``trend_up_stage``) as the starting point — this is the weight
+        # the strategy was emitting yesterday, which is what we are
+        # ramping *from*. On the transition day ``prev_weight`` is the
+        # previous held state's natural weight (1.0 for TREND_UP full,
+        # 0.5 for RANGE_BULL, etc.); on subsequent days of the phase-out
+        # ``prev_weight`` is whatever weight the strategy emitted
+        # yesterday, and the ramp walks from there toward ``target``.
+        exit_info = ctx.state["exit_in_progress"]
+        if exit_info is not None:
+            target = exit_info["target"]
+            days_left = exit_info["days_left"]
+            weight = prev_weight + (target - prev_weight) / days_left
+            # Decrement ``days_left``. When it hits 0, clear the dict so
+            # the next bar runs on the natural state logic alone. The
+            # ``<= 1`` guard handles the case where ``exit_phased_days``
+            # is configured to 1 — we still want exactly one bar of
+            # interpolation, then clear.
+            if days_left <= 1:
+                ctx.state["exit_in_progress"] = None
+            else:
+                ctx.state["exit_in_progress"] = {
+                    "target": target,
+                    "days_left": days_left - 1,
+                }
+
         ctx.state["current_state"] = new_state
         return {symbol: weight}
 
@@ -291,6 +395,28 @@ class AdxBbRegimeStrategy:
             count += 1
             offset += 1
         return count
+
+    @staticmethod
+    def _prev_state_weight(prev_state: str, trend_up_stage: str) -> float:
+        """Natural weight the strategy was emitting on the previous bar.
+
+        Used by T05's Phased Exit interpolation as the starting point of
+        the linear ramp toward ``exit_in_progress["target"]``. The held
+        states (TREND_UP, RANGE_BULL) carry non-zero natural weights;
+        TREND_DOWN and RANGE_BEAR default to 0.0. For TREND_UP the
+        HalvedStage adjusts the natural weight downward as the trailing
+        stop fires (full=1.0, halved=0.5, cleared=0.0) — this helper
+        captures that adjustment.
+        """
+        if prev_state == "TREND_UP":
+            if trend_up_stage == "full":
+                return 1.0
+            if trend_up_stage == "halved":
+                return 0.5
+            return 0.0  # "cleared"
+        if prev_state == "RANGE_BULL":
+            return 0.5
+        return 0.0  # TREND_DOWN or RANGE_BEAR
 
 
 __all__ = ["AdxBbRegimeStrategy"]
