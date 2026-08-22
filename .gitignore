@@ -32,3 +32,6 @@ strategies/*.state.json
 
 # Logs
 *.log
+
+# Per-run backtest output (T07 batch runner writes JSON here)
+reports/
