@@ -21,6 +21,7 @@ from pyecharts.charts import Bar, Grid, Kline
 from framework.charts import (
     A_SHARE_UP_COLOR,
     A_SHARE_DOWN_COLOR,
+    A_SHARE_HOLD_COLOR,
     build_kline,
     build_kline_volume_grid,
     build_volume,
@@ -75,11 +76,13 @@ def mixed_ohlcv() -> pd.DataFrame:
 
 
 def test_a_share_color_constants_match_t10_decision():
-    """T10 pins A-share convention red-up / green-down (#ec0000 / #00da3c).
-    Keep this test pinned so a future tweak can't silently drift away from
-    the agreed convention."""
+    """T10 pins A-share convention red-up / green-down. Hex codes match
+    the recommendation in ``research/chart-libraries.md`` Section 2.1
+    (Chinese-market standard). Keep these pinned so a future tweak can't
+    silently drift away from the agreed convention."""
     assert A_SHARE_UP_COLOR == "#ec0000"
-    assert A_SHARE_DOWN_COLOR == "#00da3c"
+    assert A_SHARE_DOWN_COLOR == "#14b143"
+    assert A_SHARE_HOLD_COLOR == "#888888"
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +107,33 @@ def test_mark_point_data_uses_a_share_colors():
     sell_color = items[1].opts["itemStyle"].opts.get("color")
     assert buy_color == A_SHARE_UP_COLOR
     assert sell_color == A_SHARE_DOWN_COLOR
+
+
+def test_mark_point_data_defaults_to_chinese_labels():
+    """The chart is for Chinese-market UI; markers default to 买 / 卖 / 持
+    so the legend reads correctly even when callers only pass the action
+    code (buy / sell / hold)."""
+    items = mark_point_data(
+        buy=[{"coord": ["2024-01-02", 10.5]}],
+        sell=[{"coord": ["2024-01-03", 11.0]}],
+        hold=[{"coord": ["2024-01-04", 10.7]}],
+    )
+    assert [it.opts["value"] for it in items] == ["买", "卖", "持"]
+
+
+def test_mark_point_data_sell_uses_rotated_triangle():
+    """Buy and sell share the same glyph (triangle) so they're visually
+    matched in size; the sell marker is rotated 180° so it points down —
+    matching the snippet in ``research/chart-libraries.md`` §2.1."""
+    items = mark_point_data(
+        buy=[{"coord": ["2024-01-02", 10.5]}],
+        sell=[{"coord": ["2024-01-03", 11.0]}],
+    )
+    buy_it, sell_it = items
+    assert buy_it.opts["symbol"] == "triangle"
+    assert buy_it.opts["symbolRotate"] == 0
+    assert sell_it.opts["symbol"] == "triangle"
+    assert sell_it.opts["symbolRotate"] == 180
 
 
 def test_mark_point_data_empty_inputs_returns_empty_list():

@@ -3,8 +3,8 @@
 Per ``ui-pages.md``:
   - Symbol picker (text input + recent-view dropdown via session_state)
   - K-line + MarkPoint buy/sell markers from past ``strategy_suggestions``
-    for this symbol (overlay uses one ``MarkPoint`` call per spec)
-  - Volume sub-chart via Pyecharts ``Grid``
+    for this symbol, rendered via ``framework.charts.mark_point_data``
+  - Volume sub-chart via Pyecharts ``Grid`` (built by ``framework.charts``)
   - Financials sidebar (PE/PB/分位/分红) via ``DataAdapter.get_fundamentals``
   - "Add to universe" placeholder button (gated by SPEC Open Question #1)
 

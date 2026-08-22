@@ -7,9 +7,11 @@ lived in ``pages/1_股票详情.py`` — this module is a refactor seam, not a
 redesign.
 
 Public surface:
-  * ``A_SHARE_UP_COLOR`` / ``A_SHARE_DOWN_COLOR`` — convention pins.
+  * ``A_SHARE_UP_COLOR`` / ``A_SHARE_DOWN_COLOR`` / ``A_SHARE_HOLD_COLOR``
+    — convention pins (also exported for tests).
   * ``mark_point_data`` — turn (buy, sell, hold) signal lists into
-    Pyecharts ``MarkPointItem`` objects with the right colors.
+    Pyecharts ``MarkPointItem`` objects with the right colors, glyphs,
+    and Chinese labels (买 / 卖 / 持).
   * ``build_kline`` — A-share candlestick chart with optional MarkPoints.
   * ``build_volume`` — volume sub-chart colored by per-bar direction.
   * ``build_kline_volume_grid`` — the K-line + volume Grid multi-chart.
@@ -27,27 +29,43 @@ import pandas as pd
 from pyecharts import options as opts
 from pyecharts.charts import Bar, Grid, Kline
 
-# A-share convention: red up, green down. Pinned so a future tweak can't
-# silently drift away from the T10 decision without a test failing.
+# A-share convention: red up, green down. Hex codes pinned so a future
+# tweak can't silently drift away from the T10 decision without a test
+# failing (see ``tests/test_charts.py::test_a_share_color_constants_*``).
 A_SHARE_UP_COLOR = "#ec0000"
-A_SHARE_DOWN_COLOR = "#00da3c"
+A_SHARE_DOWN_COLOR = "#14b143"
+A_SHARE_HOLD_COLOR = "#888888"
 
 
 class MarkPoint(TypedDict, total=False):
     """Schema for one buy/sell/hold overlay point.
 
-    ``coord`` is the [date_str, price] pair — Pyecharts requires the
+    ``coord`` is the ``[date_str, price]`` pair — Pyecharts requires the
     x value to be a category-axis string already in the chart's x-axis.
-    ``value`` is the label shown next to the marker.
+    ``value`` is the label shown next to the marker (defaults to the
+    Chinese verb when omitted, see ``mark_point_data``).
     """
 
     coord: list
     value: str
 
 
+# Bucket configuration for ``mark_point_data``. Centralizing the per-bucket
+# (label, color, symbol, rotate) tuple here kills the three near-identical
+# loops the first version of this module had and makes a future fourth
+# signal type (e.g. "reduce") a one-line addition.
+_BUCKET_SPECS: list[tuple[str, str, str, int, str]] = [
+    # (bucket_key, item_name, color, symbol_rotate, default_chinese_label)
+    ("buy", "buy", A_SHARE_UP_COLOR, 0, "买"),
+    ("sell", "sell", A_SHARE_DOWN_COLOR, 180, "卖"),
+    ("hold", "hold", A_SHARE_HOLD_COLOR, 0, "持"),
+]
+
+
 __all__ = [
     "A_SHARE_UP_COLOR",
     "A_SHARE_DOWN_COLOR",
+    "A_SHARE_HOLD_COLOR",
     "MarkPoint",
     "mark_point_data",
     "build_kline",
@@ -61,21 +79,6 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def _build_mark_item(
-    name: str,
-    color: str,
-    symbol: str,
-    pt: MarkPoint,
-) -> opts.MarkPointItem:
-    return opts.MarkPointItem(
-        name=name,
-        coord=list(pt["coord"]),
-        value=pt.get("value", name),
-        symbol=symbol,
-        itemstyle_opts=opts.ItemStyleOpts(color=color),
-    )
-
-
 def mark_point_data(
     buy: Iterable[MarkPoint] | None = None,
     sell: Iterable[MarkPoint] | None = None,
@@ -84,38 +87,32 @@ def mark_point_data(
     """Combine buy/sell/hold signal lists into one flat list of
     ``MarkPointItem`` objects with A-share colors.
 
-    Buy uses an upward triangle in red, sell uses a downward triangle in
-    green, hold uses a small grey dot — so the chart still reads at a
-    glance even when the active strategy emits a mix.
+    Buy uses an upward triangle in red, sell uses a downward-rotated
+    triangle in green (rotated 180°), hold uses a small grey pin — so
+    the chart still reads at a glance even when the active strategy
+    emits a mix.
+
+    The default label for each marker is the Chinese verb (买 / 卖 / 持).
+    Callers can override by setting ``MarkPoint.value`` explicitly.
     """
+    buckets: dict[str, Iterable[MarkPoint]] = {
+        "buy": buy or [],
+        "sell": sell or [],
+        "hold": hold or [],
+    }
     items: list[opts.MarkPointItem] = []
-    for pt in buy or []:
-        items.append(
-            _build_mark_item(
-                name="buy",
-                color=A_SHARE_UP_COLOR,
-                symbol="triangle",
-                pt=pt,
+    for bucket_key, item_name, color, rotate, default_label in _BUCKET_SPECS:
+        for pt in buckets[bucket_key]:
+            items.append(
+                opts.MarkPointItem(
+                    name=item_name,
+                    coord=list(pt["coord"]),
+                    value=pt.get("value", default_label),
+                    symbol="triangle",
+                    symbol_rotate=rotate,
+                    itemstyle_opts=opts.ItemStyleOpts(color=color),
+                )
             )
-        )
-    for pt in sell or []:
-        items.append(
-            _build_mark_item(
-                name="sell",
-                color=A_SHARE_DOWN_COLOR,
-                symbol="triangle",
-                pt=pt,
-            )
-        )
-    for pt in hold or []:
-        items.append(
-            _build_mark_item(
-                name="hold",
-                color="#888888",
-                symbol="pin",
-                pt=pt,
-            )
-        )
     return items
 
 
@@ -158,7 +155,7 @@ def build_kline(
                 color=A_SHARE_UP_COLOR,
                 color0=A_SHARE_DOWN_COLOR,
                 border_color="#8A0000",
-                border_color0="#008F28",
+                border_color0="#065726",
             ),
             markpoint_opts=opts.MarkPointOpts(
                 data=items,
@@ -241,11 +238,15 @@ def build_kline_volume_grid(
     hold_pts: Iterable[MarkPoint] | None = None,
     kline_height: str = "420px",
     volume_height: str = "180px",
+    total_height: str = "600px",
 ) -> Grid:
     """Stack K-line (top) + volume (bottom) into a single Grid with
     shared x-axis and crosshair linkage.
 
     This is the canonical "stock detail" view from ``pages/1_股票详情.py``.
+    ``total_height`` is the Grid container's overall height — it should
+    be at least ``kline_height + volume_height`` plus room for the top
+    axis titles and the datazoom slider.
     """
     kline = build_kline(
         df,
@@ -258,9 +259,8 @@ def build_kline_volume_grid(
     )
     volume = build_volume(df, height=volume_height)
 
-    total_h = 600
     return (
-        Grid(init_opts=opts.InitOpts(width="100%", height=f"{total_h}px"))
+        Grid(init_opts=opts.InitOpts(width="100%", height=total_height))
         .add(
             kline,
             grid_opts=opts.GridOpts(
