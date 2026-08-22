@@ -4,10 +4,22 @@ The single entry point for fetching market data. Strategies, engine, runner,
 and UI all go through `AKShareAdapter`. **This file is the only place in the
 codebase that imports `akshare`** (CAP-1, Constraint 1; CI grep enforces it).
 
-AKShare is the sole source. Accepted gaps (T1, do not silently fix):
+AKShare is the primary source. Accepted gaps (T1, do not silently fix):
   * North-bound capital (`stock_hsgt_hist_em`) dead since 2024-08-19.
   * Adjustment-factor precision (ST / IPO / restructuring) ≥10% cumulative
     error on some names.
+
+Data-source fallback:
+  * Eastmoney (`ak.stock_zh_a_hist`) is primary. On any exception, daily
+    frequency falls back to Tencent (`ak.stock_zh_a_hist_tx`) before the
+    parquet-cache fallback kicks in. Tencent is reachable from a wider set
+    of egress IPs than eastmoney's kline API and serves both A-shares and
+    Shenzhen/Shanghai ETFs through one endpoint.
+  * Minute frequencies have no Tencent fallback — eastmoney remains the
+    sole source. On failure, the cache fallback applies as before.
+  * Tencent does not expose share-count `volume`; we approximate it from
+    `amount / (close × 100)` (手). Precision is approximate but visually
+    equivalent for the volume sub-chart and OBV indicator.
 
 Failure contract (per `data-adapter.md`):
   * AKShare exception → return cache (with `stale_seconds > 0`) if present;
@@ -17,10 +29,29 @@ Failure contract (per `data-adapter.md`):
   * Unknown symbol → raise `UnknownSymbolError`.
   * Rate-limit would be exceeded → block (handled by `ratelimit` decorator
     on the global token bucket; never silently drop).
+
+Implementation note on the proxy bypass
+---------------------------------------
+On macOS, `requests` auto-loads the system proxy via `urllib.request.getproxies()`
+(the `_scproxy` module reads `scutil --proxy`). If the proxy daemon (ClashX /
+Surge / etc.) is not running, every AKShare HTTP call fails with
+`ProxyError('Unable to connect to proxy', RemoteDisconnected(...))`.
+
+By default this module does NOT bypass the proxy — the system proxy is usually
+the correct egress path to eastmoney from this region. Set `AKSHARE_DIRECT=1`
+in the environment to opt into `trust_env=False` on every `requests.Session`,
+which makes AKShare ignore both env proxy vars and the macOS system proxy and
+go straight to eastmoney. Use this only when the proxy daemon is reliably down
+AND the upstream accepts direct calls from your IP; some eastmoney endpoints
+refuse direct connections from non-Chinese or WAF-flagged IPs.
+
+Tests stub `_fetch_bars` and never construct a real Session, so this is
+invisible to the test suite.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -35,6 +66,36 @@ from framework.data.cache import (
     write_cache,
 )
 from framework.data.ratelimit import ratelimit
+
+
+# ---------------------------------------------------------------------------
+# Proxy bypass — see module docstring, "Implementation note on the proxy bypass".
+# Opt-in via env var `AKSHARE_DIRECT=1`. Default: leave the proxy path intact.
+# ---------------------------------------------------------------------------
+
+
+def _force_direct_connection() -> None:
+    """Patch `requests.Session.__init__` so every Session created anywhere in
+    the process defaults to `trust_env=False`.
+
+    This must run at module import time so that any Session AKShare constructs
+    per-call (inside its `ak.stock_zh_a_hist` / `ak.stock_zh_a_hist_min_em` /
+    `ak.stock_zh_a_spot_em` / etc. functions) inherits the bypass.
+    """
+    import requests
+
+    _original_init = requests.Session.__init__
+
+    def _patched_init(self, *args, **kwargs):
+        _original_init(self, *args, **kwargs)
+        self.trust_env = False
+
+    requests.Session.__init__ = _patched_init  # type: ignore[assignment]
+
+
+if os.environ.get("AKSHARE_DIRECT") == "1":
+    _force_direct_connection()
+
 
 Frequency = Literal["daily", "1m", "5m", "15m", "60m"]
 Adj = Literal["qfq", "hfq", "none"]
@@ -168,29 +229,55 @@ class AKShareAdapter:
     def _fetch_bars(
         self, symbol: str, start: date, end: date, adj: Adj, frequency: Frequency
     ) -> pd.DataFrame | None:
-        """Call AKShare and return a normalized DataFrame (English columns)."""
+        """Call AKShare and return a normalized DataFrame (English columns).
+
+        Eastmoney is the primary source. On exception, fall back to Tencent
+        (`ak.stock_zh_a_hist_tx`) for daily frequency — Tencent is reachable
+        from a wider set of egress IPs than eastmoney's kline API, and serves
+        both stocks and ETFs through the same endpoint.
+
+        If both fail, the original eastmoney exception propagates so the
+        caller's cache fallback (`get_bars`) still kicks in.
+        """
         # Import only here — keeps the rest of the codebase akshare-free.
         import akshare as ak
 
-        if frequency == "daily":
-            df = ak.stock_zh_a_hist(
+        try:
+            if frequency == "daily":
+                df = ak.stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=start.strftime("%Y%m%d"),
+                    end_date=end.strftime("%Y%m%d"),
+                    adjust="" if adj == "none" else adj,
+                )
+                return _normalize(df, _DAILY_COLUMN_MAP)
+            # minute / minute-em endpoint
+            period_str = _FREQ_TO_AKSHARE_PERIOD[frequency]
+            df = ak.stock_zh_a_hist_min_em(
                 symbol=symbol,
-                period="daily",
-                start_date=start.strftime("%Y%m%d"),
-                end_date=end.strftime("%Y%m%d"),
+                period=period_str,
+                start_date=start.strftime("%Y-%m-%d") + " 09:30:00",
+                end_date=end.strftime("%Y-%m-%d") + " 15:00:00",
                 adjust="" if adj == "none" else adj,
             )
-            return _normalize(df, _DAILY_COLUMN_MAP)
-        # minute / minute-em endpoint
-        period_str = _FREQ_TO_AKSHARE_PERIOD[frequency]
-        df = ak.stock_zh_a_hist_min_em(
-            symbol=symbol,
-            period=period_str,
-            start_date=start.strftime("%Y-%m-%d") + " 09:30:00",
-            end_date=end.strftime("%Y-%m-%d") + " 15:00:00",
-            adjust="" if adj == "none" else adj,
-        )
-        return _normalize(df, _MINUTE_COLUMN_MAP)
+            return _normalize(df, _MINUTE_COLUMN_MAP)
+        except Exception as eastmoney_exc:
+            # Eastmoney unreachable / refused (e.g. egress IP is WAF-flagged).
+            # Try Tencent — daily only; minute frequencies have no fallback.
+            if frequency != "daily":
+                raise
+            try:
+                tx_df = _fetch_bars_tx(symbol, start, end, adj)
+            except Exception as tx_exc:
+                # Both upstreams failed — surface the original eastmoney error
+                # so the message is the one the operator can act on.
+                raise eastmoney_exc from tx_exc
+            if tx_df is None or tx_df.empty:
+                # Tencent doesn't recognize the symbol; let the caller treat
+                # this as an empty response.
+                return tx_df
+            return tx_df
 
     # ----- fundamentals --------------------------------------------------
 
@@ -287,3 +374,55 @@ def _normalize(df: pd.DataFrame | None, colmap: dict[str, str]) -> pd.DataFrame 
     out["date"] = pd.to_datetime(out["date"]).dt.date
     out = out.sort_values("date").reset_index(drop=True)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Tencent fallback (ak.stock_zh_a_hist_tx)
+# ---------------------------------------------------------------------------
+
+
+def _tencent_symbol(symbol: str) -> str:
+    """Add the `sh` / `sz` market prefix that `ak.stock_zh_a_hist_tx` requires.
+
+    A-share convention by first digit:
+      * `5/6/9` → Shanghai (A-shares, ETFs, B-shares, STAR)
+      * `0/1/2/3` → Shenzhen (A-shares, ETFs, B-shares, ChiNext)
+    """
+    s = symbol.strip().lower()
+    if s.startswith(("sh", "sz")):
+        return s
+    return ("sh" if s[0] in "569" else "sz") + s
+
+
+def _fetch_bars_tx(
+    symbol: str, start: date, end: date, adj: Adj
+) -> pd.DataFrame | None:
+    """Daily bars via Tencent (`ak.stock_zh_a_hist_tx`).
+
+    Columns are `[date, open, close, high, low, amount]` — Tencent does not
+    expose share-count volume. We approximate `volume` from `amount / close`
+    so the volume sub-chart and OBV indicator keep working. Precision is
+    approximate (uses close instead of VWAP) but visually equivalent.
+    """
+    import akshare as ak
+
+    df = ak.stock_zh_a_hist_tx(
+        symbol=_tencent_symbol(symbol),
+        start_date=start.strftime("%Y-%m-%d"),
+        end_date=end.strftime("%Y-%m-%d"),
+        adjust="" if adj == "none" else adj,
+    )
+    if df is None or df.empty:
+        return df
+    # Cast numeric columns (AKShare returns strings / objects).
+    for col in ("open", "close", "high", "low", "amount"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    # Approximate volume (手 = 100 股). NaN-safe: NaN close → 0; no row drops.
+    close_safe = df["close"].where(df["close"] > 0)
+    df["volume"] = (df["amount"] / (close_safe * 100.0)).where(
+        close_safe.notna(), other=pd.NA
+    )
+    df = df[_OUT_COLUMNS].copy()
+    df = df.sort_values("date").reset_index(drop=True)
+    return df

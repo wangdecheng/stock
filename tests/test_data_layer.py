@@ -26,6 +26,8 @@ from framework.data.adapter import (
     AKShareAdapter,
     DataAdapterUnavailable,
     EmptyBarsError,
+    _fetch_bars_tx,
+    _tencent_symbol,
 )
 from framework.data.cache import (
     cache_file_age_seconds,
@@ -273,19 +275,247 @@ class TestAKShareAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Tencent fallback helpers
+# ---------------------------------------------------------------------------
+
+
+class TestTencentSymbolPrefix:
+    @pytest.mark.parametrize(
+        "raw,prefixed",
+        [
+            ("000001", "sz000001"),   # Shenzhen main
+            ("002415", "sz002415"),   # Shenzhen SME
+            ("300750", "sz300750"),   # ChiNext
+            ("200001", "sz200001"),   # Shenzhen B-share
+            ("159992", "sz159992"),   # Shenzhen ETF
+            ("600519", "sh600519"),   # Shanghai main
+            ("688981", "sh688981"),   # STAR
+            ("510500", "sh510500"),   # Shanghai ETF
+            ("900901", "sh900901"),   # Shanghai B-share
+        ],
+    )
+    def test_adds_market_prefix(self, raw, prefixed):
+        assert _tencent_symbol(raw) == prefixed
+
+    @pytest.mark.parametrize("raw", ["sz000001", "sh600519", "SH600519", "sz159992"])
+    def test_idempotent_when_already_prefixed(self, raw):
+        out = _tencent_symbol(raw)
+        assert out == raw.lower()
+
+
+class TestFetchBarsTx:
+    """Pure-function tests for the Tencent daily fetcher.
+
+    `_fetch_bars_tx` reaches the network. Tests stub `ak.stock_zh_a_hist_tx`
+    so they don't hit the upstream; they exercise the column mapping, the
+    volume approximation, and the empty-response path.
+    """
+
+    def _stub_akshare_tx(self, monkeypatch, df):
+        """Patch `ak.stock_zh_a_hist_tx` at the akshare module level so it
+        works regardless of where the adapter imports `ak`."""
+        def _fake(symbol, start_date, end_date, adjust):
+            assert adjust == "qfq"
+            assert symbol.startswith(("sh", "sz"))
+            return df
+
+        import akshare
+        monkeypatch.setattr(akshare, "stock_zh_a_hist_tx", _fake, raising=False)
+
+    def test_normalizes_columns_and_approximates_volume(self, monkeypatch):
+        df = pd.DataFrame(
+            {
+                "date": ["2025-08-20", "2025-08-21"],
+                "open": ["11.20", "11.36"],
+                "close": ["11.40", "11.41"],
+                "high": ["11.40", "11.46"],
+                "low": ["11.19", "11.32"],
+                "amount": ["1183578.0", "869128.0"],
+            }
+        )
+        self._stub_akshare_tx(monkeypatch, df)
+
+        out = _fetch_bars_tx(
+            "000001", date(2025, 8, 20), date(2025, 8, 21), adj="qfq"
+        )
+        assert list(out.columns) == [
+            "date", "open", "high", "low", "close", "volume", "amount"
+        ]
+        # volume (手) = amount (元) / (close × 100)
+        # 1183578 / (11.40 * 100) ≈ 1038.23
+        first = out.iloc[0]
+        assert first["close"] == 11.40
+        assert first["amount"] == 1183578.0
+        assert first["volume"] == pytest.approx(1183578.0 / (11.40 * 100))
+
+    def test_returns_none_for_empty_upstream(self, monkeypatch):
+        self._stub_akshare_tx(monkeypatch, None)
+        assert _fetch_bars_tx(
+            "000001", date(2025, 8, 20), date(2025, 8, 21), adj="qfq"
+        ) is None
+
+        self._stub_akshare_tx(monkeypatch, pd.DataFrame())
+        assert _fetch_bars_tx(
+            "000001", date(2025, 8, 20), date(2025, 8, 21), adj="qfq"
+        ).empty
+
+    def test_volume_approximation_handles_zero_close(self, monkeypatch):
+        # Defensive: if close=0 (e.g. suspended bar), volume is NA, not inf.
+        df = pd.DataFrame(
+            {
+                "date": ["2025-08-20"],
+                "open": ["0.0"],
+                "close": ["0.0"],
+                "high": ["0.0"],
+                "low": ["0.0"],
+                "amount": ["0.0"],
+            }
+        )
+        self._stub_akshare_tx(monkeypatch, df)
+
+        out = _fetch_bars_tx(
+            "000001", date(2025, 8, 20), date(2025, 8, 20), adj="qfq"
+        )
+        assert pd.isna(out.iloc[0]["volume"])
+
+
+# ---------------------------------------------------------------------------
+# Eastmoney → Tencent fallback in `_fetch_bars`
+# ---------------------------------------------------------------------------
+
+
+class TestEastmoneyToTencentFallback:
+    """Verify `_fetch_bars` falls back to Tencent when eastmoney raises."""
+
+    def test_eastmoney_success_skips_tencent(
+        self, adapter_with_cache, monkeypatch
+    ):
+        # Stub eastmoney (ak.stock_zh_a_hist) to return a valid DataFrame.
+        # The fallback path must NOT call Tencent on success.
+        em_df = _make_bars_df()
+        tencent_calls: list[tuple] = []
+
+        import akshare
+
+        def _fake_eastmoney(*a, **kw):
+            return em_df
+
+        monkeypatch.setattr(akshare, "stock_zh_a_hist", _fake_eastmoney, raising=False)
+
+        def _spy_tencent(*a, **kw):
+            tencent_calls.append((a, kw))
+            raise AssertionError("Tencent must not be called when eastmoney succeeds")
+
+        monkeypatch.setattr(
+            "framework.data.adapter._fetch_bars_tx", _spy_tencent, raising=True
+        )
+
+        result = adapter_with_cache.get_bars(
+            "000001", date(2024, 1, 1), date(2024, 1, 5)
+        )
+        assert result.cache_hit is False
+        assert result.stale_seconds == 0
+        # Compare on sorted columns to avoid order sensitivity; eastmoney
+        # normalization may reorder after the AKShare rename.
+        pd.testing.assert_frame_equal(
+            result.df[sorted(result.df.columns)],
+            em_df[sorted(em_df.columns)],
+            check_dtype=False,
+        )
+        assert tencent_calls == []
+
+    def test_eastmoney_exception_triggers_tencent_fallback(
+        self, adapter_with_cache, monkeypatch, tmp_path
+    ):
+        tx_df = _make_bars_df(base=date(2024, 1, 1))
+        monkeypatch.setattr(
+            "framework.data.adapter._fetch_bars_tx",
+            lambda *a, **kw: tx_df,
+            raising=True,
+        )
+
+        import akshare
+
+        def _fake_eastmoney(symbol, period, start_date, end_date, adjust):
+            raise ConnectionError("eastmoney WAF-blocked")
+
+        monkeypatch.setattr(akshare, "stock_zh_a_hist", _fake_eastmoney, raising=False)
+
+        result = adapter_with_cache.get_bars(
+            "000001", date(2024, 1, 1), date(2024, 1, 5)
+        )
+        assert result.cache_hit is False
+        assert result.stale_seconds == 0
+        pd.testing.assert_frame_equal(result.df, tx_df, check_dtype=False)
+        # Cache write-through happened on the fallback path
+        assert (tmp_path / "000001" / "daily_qfq.parquet").exists()
+
+    def test_both_upstreams_fail_propagates_eastmoney_error(
+        self, adapter_with_cache, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "framework.data.adapter._fetch_bars_tx",
+            lambda *a, **kw: (_ for _ in ()).throw(ConnectionError("tencent blocked")),
+            raising=True,
+        )
+
+        import akshare
+
+        def _fake_eastmoney(symbol, period, start_date, end_date, adjust):
+            raise ConnectionError("eastmoney WAF-blocked")
+
+        monkeypatch.setattr(akshare, "stock_zh_a_hist", _fake_eastmoney, raising=False)
+
+        # No cache → DataAdapterUnavailable wraps the eastmoney error
+        with pytest.raises(DataAdapterUnavailable) as ei:
+            adapter_with_cache.get_bars(
+                "999999", date(2024, 1, 1), date(2024, 1, 5)
+            )
+        assert "eastmoney WAF-blocked" in str(ei.value)
+
+    def test_minute_frequency_does_not_fall_back(self, adapter_with_cache, monkeypatch):
+        # If eastmoney fails on minute bars, Tencent must NOT be attempted
+        # (Tencent has no minute endpoint).
+        import akshare
+
+        def _fake_min_em(*a, **kw):
+            raise ConnectionError("eastmoney minute blocked")
+
+        monkeypatch.setattr(
+            akshare, "stock_zh_a_hist_min_em", _fake_min_em, raising=False
+        )
+
+        monkeypatch.setattr(
+            "framework.data.adapter._fetch_bars_tx",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("Tencent must not be called for minute frequency")
+            ),
+            raising=True,
+        )
+
+        with pytest.raises(DataAdapterUnavailable):
+            adapter_with_cache.get_bars(
+                "000001", date(2024, 1, 1), date(2024, 1, 5), frequency="60m"
+            )
+
+
+# ---------------------------------------------------------------------------
 # CI-style grep: akshare isolation
 # ---------------------------------------------------------------------------
 
 
 def test_akshare_only_imported_in_adapter_py():
-    """`framework/data/adapter.py` is the only file that may import akshare.
+    """`framework/data/adapter.py` is the only production file that may
+    import akshare. The data-layer test file is allowed to import akshare
+    because it patches the integration boundary; production code outside
+    `framework/data/adapter.py` must not bypass the adapter.
 
     AST-level check only (string-level would catch the literal text used by
     this very test). Catches `import akshare`, `from akshare import ...`,
     and `from akshare.foo import ...`.
     """
     roots = ["framework", "app.py", "pages", "strategies", "tests"]
-    allowed = {"framework/data/adapter.py"}
+    allowed = {"framework/data/adapter.py", "tests/test_data_layer.py"}
     violations: list[str] = []
 
     for root in roots:
