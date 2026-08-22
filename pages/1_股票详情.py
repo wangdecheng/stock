@@ -8,7 +8,9 @@ Per ``ui-pages.md``:
   - Financials sidebar (PE/PB/分位/分红) via ``DataAdapter.get_fundamentals``
   - "Add to universe" placeholder button (gated by SPEC Open Question #1)
 
-Charts: Pyecharts + ``streamlit_echarts`` ONLY (per T10).
+Charts: Pyecharts + ``streamlit_echarts`` ONLY (per T10). The chart
+construction itself lives in ``framework.charts`` — this page is only
+responsible for wiring signals to it.
 """
 
 from __future__ import annotations
@@ -19,10 +21,9 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
-from pyecharts import options as opts
-from pyecharts.charts import Bar, Grid, Kline
 from streamlit_echarts import st_pyecharts
 
+from framework.charts import MarkPoint, build_kline_volume_grid
 from framework.data.adapter import (
     AKShareAdapter,
     DataAdapterUnavailable,
@@ -158,7 +159,6 @@ if df.empty:
 
 dates = [d.isoformat() if hasattr(d, "isoformat") else str(d) for d in df["date"]]
 ohlc = df[["open", "close", "low", "high"]].values.tolist()
-volumes = df["volume"].tolist()
 
 
 # ----- historical signals (MarkPoint overlay) ------------------------------
@@ -167,9 +167,9 @@ volumes = df["volume"].tolist()
 # Per ui-pages.md: "Read past strategy_suggestions for this symbol under the
 # active strategy — render them as MarkPoints color-coded by action."
 active_id = get_active_strategy_id()
-buy_pts: list[dict] = []
-sell_pts: list[dict] = []
-hold_pts: list[dict] = []
+buy_pts: list[MarkPoint] = []
+sell_pts: list[MarkPoint] = []
+hold_pts: list[MarkPoint] = []
 if active_id is not None:
     try:
         conn = get_connection()
@@ -179,14 +179,12 @@ if active_id is not None:
     # Map date -> MarkPoint coordinate. We index by the bar date so the
     # markers land exactly on the K-line bar (not on the suggestion's
     # generated_at, which has resolution finer than the daily bar).
-    date_to_idx = {d: i for i, d in enumerate(dates)}
     for s in history:
         if s.symbol != symbol:
             continue
         # Use target_price as the marker's y-value when present (price
         # precision beats the bar's high/low for visibility).
         y = s.target_price if s.target_price is not None else None
-        # Find the bar date >= generated_at date.
         gen = s.generated_at.date() if hasattr(s.generated_at, "date") else s.generated_at
         # nearest date in our series
         idx = _nearest_date_index(dates, gen)
@@ -195,96 +193,23 @@ if active_id is not None:
         if y is None:
             # fall back to bar close at that idx
             y = float(ohlc[idx][1])
-        coord = {"coord": [dates[idx], float(y)]}
+        coord: list = [dates[idx], float(y)]
+        marker: MarkPoint = {"coord": coord, "value": s.action}
         bucket = {"buy": buy_pts, "sell": sell_pts, "hold": hold_pts}.get(s.action)
         if bucket is not None:
-            bucket.append({**coord, "value": s.action})
-
-markpoint_data = (
-    [{"name": "buy", "coord": p["coord"], "value": "买", "itemStyle": opts.ItemStyleOpts(color="#ec0000")}
-     for p in buy_pts]
-    + [{"name": "sell", "coord": p["coord"], "value": "卖", "itemStyle": opts.ItemStyleOpts(color="#00da3c")}
-        for p in sell_pts]
-    + [{"name": "hold", "coord": p["coord"], "value": "持", "itemStyle": opts.ItemStyleOpts(color="#888")}
-        for p in hold_pts]
-)
+            bucket.append(marker)
 
 
 # ----- k-line + volume (Grid) ----------------------------------------------
 
 
-kline = (
-    Kline(init_opts=opts.InitOpts(width="100%", height="420px"))
-    .add_xaxis(dates)
-    .add_yaxis(
-        f"{symbol} · {_ADJ_LABELS[adj]} · 日 K",
-        ohlc,
-        itemstyle_opts=opts.ItemStyleOpts(
-            color="#ec0000",
-            color0="#00da3c",
-            border_color="#8A0000",
-            border_color0="#008F28",
-        ),
-        markpoint_opts=opts.MarkPointOpts(
-            data=markpoint_data,
-            symbol_size=42,
-            label_opts=opts.LabelOpts(position="top", color="#fff", font_size=10),
-        ) if markpoint_data else opts.MarkPointOpts(data=[]),
-    )
-    .set_global_opts(
-        title_opts=opts.TitleOpts(title=f"{symbol}", pos_left="center"),
-        xaxis_opts=opts.AxisOpts(type_="category", is_scale=True, grid_index=0),
-        yaxis_opts=opts.AxisOpts(is_scale=True, grid_index=0),
-        legend_opts=opts.LegendOpts(pos_top="3%"),
-        tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross"),
-        datazoom_opts=[opts.DataZoomOpts(type_="inside", xaxis_index=[0, 1])],
-        axispointer_opts=opts.AxisPointerOpts(
-            is_show=True,
-            link=[{"xAxisIndex": "all"}],
-            label=opts.LabelOpts(background_color="#777"),
-        ),
-    )
-)
-
-# Color volumes red/green by the day's direction so the volume sub-chart
-# echoes the K-line (a small but common Chinese-market convention).
-# Splitting into two stacked series (up-day vol + down-day vol) is the
-# idiomatic Pyecharts pattern for per-bar colors.
-red_vols = [v if c >= o else 0 for v, o, c in zip(volumes, df["open"], df["close"])]
-green_vols = [v if c < o else 0 for v, o, c in zip(volumes, df["open"], df["close"])]
-bar = (
-    Bar()
-    .add_xaxis(dates)
-    .add_yaxis(
-        "↑",
-        red_vols,
-        stack="总量",
-        itemstyle_opts=opts.ItemStyleOpts(color="#ec0000"),
-    )
-    .add_yaxis(
-        "↓",
-        green_vols,
-        stack="总量",
-        itemstyle_opts=opts.ItemStyleOpts(color="#00da3c"),
-    )
-    .set_global_opts(
-        xaxis_opts=opts.AxisOpts(type_="category", grid_index=1),
-        yaxis_opts=opts.AxisOpts(grid_index=1),
-        tooltip_opts=opts.TooltipOpts(trigger="axis", axis_pointer_type="cross"),
-        legend_opts=opts.LegendOpts(pos_top="3%"),
-    )
-)
-
-grid = (
-    Grid(init_opts=opts.InitOpts(width="100%", height="600px"))
-    .add(
-        kline,
-        grid_opts=opts.GridOpts(pos_left="8%", pos_right="4%", pos_top="8%", height="60%"),
-    )
-    .add(
-        bar,
-        grid_opts=opts.GridOpts(pos_left="8%", pos_right="4%", pos_top="72%", height="20%"),
-    )
+grid = build_kline_volume_grid(
+    df,
+    symbol=symbol,
+    adj_label=_ADJ_LABELS[adj],
+    buy_pts=buy_pts,
+    sell_pts=sell_pts,
+    hold_pts=hold_pts,
 )
 st_pyecharts(grid, height="600px")
 
