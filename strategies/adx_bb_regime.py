@@ -3,10 +3,11 @@
 Spec reference: ``.scratch/adx-bb-regime/spec.md`` (D3 / D4 / D5 / D8 / D9).
 
 This file implements the full four-regime StateMachine (TREND_UP /
-TREND_DOWN / RANGE_BULL / RANGE_BEAR) and the Hysteresis Gate from D3/D4:
-a 2-day confirmation that ADX is in a TREND_UP configuration before the
-strategy actually enters that state. Phased exit (T05), HalvedStage (T04),
-and the Range_Bull signal stack (T06) are out of scope here.
+TREND_DOWN / RANGE_BULL / RANGE_BEAR), the Hysteresis Gate from D3/D4
+(a 2-day confirmation that ADX is in a TREND_UP configuration before the
+strategy actually enters that state), and the HalvedStage internal
+trailing stop from D3 / T04. Phased exit (T05) and the Range_Bull signal
+stack (T06) are out of scope here.
 
 State persistence follows D5: five keys are populated on first run via
 ``ctx.state.setdefault(...)`` so pre-existing values (e.g. from a hand-
@@ -28,6 +29,20 @@ at 0 on first run and block a legitimate multi-bar trend in tests) and
 keeps ``ctx.state["pending_state"] / "pending_days"`` from being
 clobbered on user-edited state — the same property T02's
 ``test_state_keys_not_clobbered_on_second_run`` pins.
+
+HalvedStage (T04)
+-----------------
+Inside the TREND_UP branch, ``ctx.state["trend_up_stage"]`` carries a
+three-stage internal stop machine:
+
+    full     default Close-vs-MA20 watch     weight = 1.00
+    halved   Close < MA20 has fired          weight = 0.50
+    cleared  Close < MA10 has fired (post-half) weight = 0.00
+
+Re-entering TREND_UP from any other state resets ``trend_up_stage`` to
+``"full"`` so a fresh trend gets the full two-stage stop again. The
+Close-vs-MA breaches use **strict** ``<`` so Close == MA20 is *not* a
+trigger.
 """
 
 from __future__ import annotations
@@ -84,6 +99,12 @@ class AdxBbRegimeStrategy:
         ctx.state.setdefault("trend_up_stage", "full")
         ctx.state.setdefault("exit_in_progress", None)
 
+        # Capture the previous bar's state for T04's re-entry detection.
+        # ``ctx.state["current_state"]`` is the LAST bar's state (set at
+        # the bottom of this method), so this is what was active before
+        # today's classification.
+        prev_state = ctx.state["current_state"]
+
         # Universe is exactly one symbol per D2. ``ctx.universe[0]`` is
         # the contract.
         symbol = ctx.universe[0]
@@ -93,6 +114,7 @@ class AdxBbRegimeStrategy:
         df = ctx.bars(symbol, lookback=120)
 
         adx_df = ctx.indicator("adx", df, length=self.adx_len)
+        ma10 = ctx.indicator("ma", df, length=10)
         ma20 = ctx.indicator("ma", df, length=20)
         ma60 = ctx.indicator("ma", df, length=60)
         bb_df = ctx.indicator(
@@ -104,6 +126,7 @@ class AdxBbRegimeStrategy:
         plus_di_today = float(adx_df["plus_di"].iloc[-1])
         minus_di_today = float(adx_df["minus_di"].iloc[-1])
         close_today = float(df["close"].iloc[-1])
+        ma10_today = float(ma10.iloc[-1])
         ma20_today = float(ma20.iloc[-1])
         ma60_today = float(ma60.iloc[-1])
         bb_mid_today = float(bb_df["mid"].iloc[-1])
@@ -160,6 +183,39 @@ class AdxBbRegimeStrategy:
             # RANGE_BEAR — the explicit fallback (else branch in D3).
             new_state = "RANGE_BEAR"
             weight = 0.0
+
+        # ----- T04: HalvedStage machine --------------------------------
+        # Evaluated only when ``new_state == TREND_UP`` (we are inside
+        # the held TREND_UP branch this bar). Re-entry from another
+        # state resets the stage to ``"full"`` so a fresh trend gets
+        # the full two-stage stop; otherwise the three-stage rule
+        # transitions the stage on strict ``<`` breaches.
+        if new_state == "TREND_UP":
+            if prev_state != "TREND_UP":
+                # Re-entry from another state — reset to full, weight
+                # is the stage's default (1.0).
+                ctx.state["trend_up_stage"] = "full"
+                weight = 1.0
+            else:
+                # Stay in TREND_UP — apply the three-stage rule.
+                stage = ctx.state["trend_up_stage"]
+                if stage == "full":
+                    if close_today < ma20_today:
+                        ctx.state["trend_up_stage"] = "halved"
+                        weight = 0.5
+                    # else: keep "full", weight stays at default 1.0.
+                elif stage == "halved":
+                    if close_today < ma10_today:
+                        ctx.state["trend_up_stage"] = "cleared"
+                        weight = 0.0
+                    else:
+                        # No breach — stage stays "halved", emit its
+                        # default weight of 0.5 (no double-trigger).
+                        weight = 0.5
+                else:  # "cleared"
+                    # Fully out — weight stays at the stage's default
+                    # 0.0 and stage is unchanged.
+                    weight = 0.0
 
         ctx.state["current_state"] = new_state
         return {symbol: weight}
