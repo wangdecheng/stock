@@ -6,8 +6,9 @@ This file implements the full four-regime StateMachine (TREND_UP /
 TREND_DOWN / RANGE_BULL / RANGE_BEAR), the Hysteresis Gate from D3/D4
 (a 2-day confirmation that ADX is in a TREND_UP configuration before the
 strategy actually enters that state), the HalvedStage internal
-trailing stop from D3 / T04, and the Phased Exit mechanic from D4 / T05.
-The Range_Bull signal stack (T06) is out of scope here.
+trailing stop from D3 / T04, the Phased Exit mechanic from D4 / T05, and
+the Range_Bull signal stack from D3 / T06 (Bollinger touches + RSI
+modulator + K-line reversal patterns).
 
 State persistence follows D5: five keys are populated on first run via
 ``ctx.state.setdefault(...)`` so pre-existing values (e.g. from a hand-
@@ -71,6 +72,46 @@ Mid-exit reversals — e.g. ``TREND_UP → RANGE_BULL → TREND_UP`` where
 the second transition fires while ``exit_in_progress`` is still active —
 overwrite the dict with the new destination and reset ``days_left``.
 The strategy does NOT try to "undo" a partial exit.
+
+Range_Bull Signal Stack (T06)
+-----------------------------
+Inside ``RANGE_BULL`` only (the other three states fall through to their
+default weights), the strategy layers three signal sources on top of the
+0.5 half-position default, evaluated per bar with a fixed priority:
+
+  1. **Sell trigger** — ``High >= bb_upper`` wins outright, weight = 0.
+  2. **Buy triggers** (any one fires → Signal Modulator) — a buy is
+     recognized when ANY of the following holds:
+       * ``Low <= bb_lower``
+       * long lower shadow: ``(Close - Low) > 2 * |Close - Open|``
+       * bullish engulfing: today's body fully contains yesterday's body
+         AND today's ``Close > Open`` (today is bullish)
+  3. **Default** — weight = 0.5 (no signal fires on this bar).
+
+When a buy trigger fires, the **Signal Modulator** rescales the half-
+position up by a 0–1 scalar driven by RSI:
+
+    weight = 0.5 + 0.5 * clamp((30 - rsi) / 10, 0, 1)
+
+``rsi`` is read from ``ctx.indicator("rsi", df, length=self.rsi_len)``
+(default ``rsi_len=14``). The clamp caps the buy-up at ``weight = 1.0``
+when ``rsi <= 20`` and floors it at the 0.5 default when ``rsi >= 30`` —
+i.e. RSI is a *position-size* knob, never a *gate*. The full buy-up of
+``0.5 + 0.5 * 1 = 1.0`` matches the TREND_UP default, so a deep-RSI
+Range_Bull bar carries the same gross weight as a trend bar.
+
+Multiple buy triggers firing on the same bar emit exactly one weight —
+the modulator formula is identical across them. If both buy and sell
+fire on the same bar, sell wins (priority: sell > buy > default). The
+Phased Exit logic from T05 still composes on top: when this bar's
+*natural* weight (from the signal stack) differs from the prior bar's
+emitted weight on a held-state transition, T05's interpolation
+replaces the natural weight with the phased-out value.
+
+K-line pattern detectors are small private helpers co-located in this
+file (``_is_long_lower_shadow`` and ``_is_bullish_engulfing``) — they
+take the open/close (and prior bar's open/close for engulfing) and
+return a boolean.
 """
 
 from __future__ import annotations
@@ -212,10 +253,15 @@ class AdxBbRegimeStrategy:
             new_state = "TREND_DOWN"
             weight = 0.0
         elif candidate_state == "RANGE_BULL":
-            # Instant transition — RANGE_BULL default 0.5 (T06 will add
-            # the BB / RSI / K-line signal stack on top).
+            # Instant transition — RANGE_BULL runs the T06 signal stack:
+            # BB touches, RSI modulator, K-line reversal patterns. The
+            # priority order (sell > buy > default) pins ``weight`` to
+            # exactly one of {0.0, 0.5, 0.5 + 0.5 * scalar}. The Phased
+            # Exit block below may still override ``weight`` on a held-
+            # state transition (e.g. TREND_UP → RANGE_BULL).
             new_state = "RANGE_BULL"
-            weight = 0.5
+            rsi_series = ctx.indicator("rsi", df, length=self.rsi_len)
+            weight = self._range_bull_weight(df, bb_df, rsi_series)
         else:
             # RANGE_BEAR — the explicit fallback (else branch in D3).
             new_state = "RANGE_BEAR"
@@ -417,6 +463,144 @@ class AdxBbRegimeStrategy:
         if prev_state == "RANGE_BULL":
             return 0.5
         return 0.0  # TREND_DOWN or RANGE_BEAR
+
+    # ----- Range_Bull signal stack (T06) ----------------------------------
+
+    def _range_bull_weight(
+        self,
+        df: pd.DataFrame,
+        bb_df: pd.DataFrame,
+        rsi_series: pd.Series,
+    ) -> float:
+        """T06 — Range_Bull signal logic.
+
+        Priority order (sell > buy > default):
+            1. ``High >= bb_upper``                → weight = 0.0
+            2. ANY buy trigger fires (BB lower touch
+               OR long lower shadow OR bullish
+               engulfing)                            → Signal Modulator
+            3. No signal fires                      → weight = 0.5
+
+        Signal Modulator (on buy):
+            weight = 0.5 + 0.5 * clamp((30 - rsi) / 10, 0, 1)
+        where ``rsi`` is today's Wilder RSI (length = ``self.rsi_len``),
+        passed in as ``rsi_series`` so this helper has no dependency on
+        ``Context`` (and no need to re-enter the indicators registry —
+        tests can swap ``rsi`` once and have the value land here).
+
+        Multiple buy triggers firing on the same bar emit exactly one
+        weight — the modulator formula is identical across them, so the
+        result does not depend on which one matched. If both buy and
+        sell fire, sell wins (the sell branch is checked first).
+
+        The Phased Exit (T05) wraps around this — if the natural weight
+        we return here is involved in a held-state transition, T05 will
+        replace it with an interpolated value. This helper deliberately
+        ignores ``prev_state`` and ``exit_in_progress``; it is the
+        "natural" weight the strategy would emit absent the phase-out.
+        """
+        high_today = float(df["high"].iloc[-1])
+        low_today = float(df["low"].iloc[-1])
+        close_today = float(df["close"].iloc[-1])
+        open_today = float(df["open"].iloc[-1])
+        bb_lower_today = float(bb_df["lower"].iloc[-1])
+        bb_upper_today = float(bb_df["upper"].iloc[-1])
+
+        # Sell trigger — high pierces (or kisses) the upper band.
+        sell_trigger = high_today >= bb_upper_today
+        if sell_trigger:
+            return 0.0
+
+        # Buy trigger (any of three). Order does not — the modulator
+        # formula is identical regardless of which one fires.
+        bb_lower_touch = low_today <= bb_lower_today
+        long_shadow = AdxBbRegimeStrategy._is_long_lower_shadow(
+            close_today, low_today, open_today
+        )
+        # Bullish engulfing needs yesterday's body. When the df has
+        # fewer than 2 rows (warmup) the pattern is undefined → False.
+        if len(df) >= 2:
+            prev_open = float(df["open"].iloc[-2])
+            prev_close = float(df["close"].iloc[-2])
+            engulfing = AdxBbRegimeStrategy._is_bullish_engulfing(
+                today_open=open_today,
+                today_close=close_today,
+                today_high=high_today,
+                today_low=low_today,
+                prev_open=prev_open,
+                prev_close=prev_close,
+            )
+        else:
+            engulfing = False
+
+        buy_trigger = bb_lower_touch or long_shadow or engulfing
+        if not buy_trigger:
+            return 0.5
+
+        # Signal Modulator — RSI-driven 0..1 scalar added to the 0.5
+        # default. The clamp caps the buy-up at 1.0 (matches TREND_UP)
+        # when ``rsi <= 20`` and floors it at 0.5 (the default applies)
+        # when ``rsi >= 30``.
+        rsi_today = float(rsi_series.iloc[-1])
+        scalar = (30.0 - rsi_today) / 10.0
+        if scalar < 0.0:
+            scalar = 0.0
+        elif scalar > 1.0:
+            scalar = 1.0
+        return 0.5 + 0.5 * scalar
+
+    @staticmethod
+    def _is_long_lower_shadow(
+        close: float, low: float, open: float
+    ) -> bool:
+        """Long lower shadow K-line pattern: ``(Close - Low) > 2 * |Close - Open|``.
+
+        The lower shadow length (``Close - Low``) more than doubles the
+        candle body length (``|Close - Open|``). Indicates buyers stepped
+        in intraday to defend a level — a range-bound reversal cue.
+
+        Edge cases: ``Close == Open`` (doji) gives body = 0, so any
+        positive lower shadow fires — we accept this since a doji with a
+        long lower shadow is still a reversal signal. ``Close < Low``
+        would be malformed OHLCV; the formula yields a negative number
+        and ``> 2 * body`` is False, so we naturally reject it.
+        """
+        body = abs(close - open)
+        lower_shadow = close - low
+        return lower_shadow > 2.0 * body
+
+    @staticmethod
+    def _is_bullish_engulfing(
+        today_open: float,
+        today_close: float,
+        today_high: float,
+        today_low: float,
+        prev_open: float,
+        prev_close: float,
+    ) -> bool:
+        """Bullish engulfing K-line pattern: today's body fully contains
+        yesterday's body AND today's ``Close > Open`` (today is bullish).
+
+        For a bullish bar the body's lower edge is ``today_open`` and the
+        upper edge is ``today_close``. "Today's body fully contains
+        yesterday's body" reduces to two conditions:
+            today_open  <= prev_open    (today opens at or below yesterday's open)
+            today_close >= prev_close  (today closes at or above yesterday's close)
+
+        Today's ``high`` / ``low`` and yesterday's ``high`` / ``low`` are
+        accepted in the signature for clarity (the spec lists all four
+        OHLC values per bar), but they do not enter the formula — body
+        containment is a close-vs-open property.
+
+        If yesterday's body is itself bearish (``prev_close < prev_open``),
+        the engulfing pattern is even more reliable, but the spec does not
+        require it: any prior body fully contained by a bullish today
+        counts.
+        """
+        if today_close <= today_open:
+            # Today must be bullish; bearish engulfing is not a buy cue.
+            return False
+        return today_open <= prev_open and today_close >= prev_close
 
 
 __all__ = ["AdxBbRegimeStrategy"]
