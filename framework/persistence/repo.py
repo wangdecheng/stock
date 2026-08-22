@@ -79,6 +79,25 @@ class MissingTargetPriceError(RepoError):
     """
 
 
+class VirtualBookNotFoundError(RepoError):
+    """The requested ``virtual_books.strategy_id`` row does not exist.
+
+    Raised by T11's :func:`adjust_virtual_cash` and
+    :func:`set_virtual_initial_cash` when the strategy has no book yet.
+    Callers should call :func:`ensure_virtual_book` first (which is what
+    :func:`apply_suggestions_to_book` already does internally).
+    """
+
+
+class InsufficientCashError(RepoError):
+    """A withdrawal would drive ``virtual_books.cash`` below zero.
+
+    A-share cash accounts can't go negative, and the spec treats the book
+    as a strict cash ledger. The function rejects the write *before*
+    touching the row, so the DB is unchanged on failure.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses (DB → typed)
 # ---------------------------------------------------------------------------
@@ -357,6 +376,131 @@ def ensure_virtual_book(
         (strategy_id,),
     ).fetchone()
     return _row_to_virtual_book(row)
+
+
+def adjust_virtual_cash(
+    conn: sqlite3.Connection,
+    strategy_id: str,
+    delta: float,
+) -> VirtualBook:
+    """Apply an external cash flow (deposit or withdrawal) to a virtual book.
+
+    Per T11 (ui-pages.md "Cash & top-up / withdraw"): deposits and
+    withdrawals must shift ``cash`` AND ``initial_cash`` together so the
+    dashboard's ``cash - initial_cash`` P&L metric is not distorted by
+    external flows.
+
+    Parameters
+    ----------
+    delta
+        Positive = deposit, negative = withdraw. ``0`` is a no-op.
+
+    Raises
+    ------
+    VirtualBookNotFoundError
+        No row for ``strategy_id``. Call :func:`ensure_virtual_book` first.
+    InsufficientCashError
+        Withdrawal would drive ``cash`` below zero. The book is left
+        untouched (read-then-check-then-write under ``BEGIN IMMEDIATE``).
+    """
+    conn.row_factory = sqlite3.Row
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT cash, initial_cash FROM virtual_books WHERE strategy_id = ?",
+            (strategy_id,),
+        ).fetchone()
+        if row is None:
+            raise VirtualBookNotFoundError(
+                f"virtual book for strategy {strategy_id!r} not found; "
+                "call ensure_virtual_book() first"
+            )
+        cash = float(row["cash"])
+        initial_cash = float(row["initial_cash"])
+
+        if delta == 0.0:
+            # No-op; still bump updated_at? No — a no-op write shouldn't
+            # lie to the operator about state having changed.
+            conn.execute("COMMIT")
+            book_row = conn.execute(
+                "SELECT * FROM virtual_books WHERE strategy_id = ?",
+                (strategy_id,),
+            ).fetchone()
+            return _row_to_virtual_book(book_row)
+
+        new_cash = cash + delta
+        if new_cash < 0.0:
+            raise InsufficientCashError(
+                f"withdrawal of {-delta:,.2f} would leave cash {new_cash:,.2f} "
+                f"(current cash {cash:,.2f}); refused"
+            )
+        new_initial = initial_cash + delta
+
+        conn.execute(
+            "UPDATE virtual_books "
+            "SET cash = ?, initial_cash = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE strategy_id = ?",
+            (new_cash, new_initial, strategy_id),
+        )
+        book_row = conn.execute(
+            "SELECT * FROM virtual_books WHERE strategy_id = ?",
+            (strategy_id,),
+        ).fetchone()
+        conn.execute("COMMIT")
+        return _row_to_virtual_book(book_row)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def set_virtual_initial_cash(
+    conn: sqlite3.Connection,
+    strategy_id: str,
+    initial_cash: float,
+) -> VirtualBook:
+    """Re-base the ``initial_cash`` benchmark for a strategy's book.
+
+    Distinct from :func:`adjust_virtual_cash`: this is NOT a cash flow.
+    It only changes the P&L benchmark; ``cash`` is left untouched.
+
+    Re-basing is useful when the operator changes the strategy's
+    reference capital (e.g. resets the book to a new ¥200 000 baseline
+    without recording an actual deposit).
+
+    Raises
+    ------
+    VirtualBookNotFoundError
+        No row for ``strategy_id``.
+    ValueError
+        ``initial_cash`` is negative — the spec treats it as a non-neg
+        benchmark.
+    """
+    if initial_cash < 0.0:
+        raise ValueError(
+            f"initial_cash must be >= 0; got {initial_cash}"
+        )
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT 1 FROM virtual_books WHERE strategy_id = ?",
+        (strategy_id,),
+    ).fetchone()
+    if row is None:
+        raise VirtualBookNotFoundError(
+            f"virtual book for strategy {strategy_id!r} not found; "
+            "call ensure_virtual_book() first"
+        )
+    conn.execute(
+        "UPDATE virtual_books "
+        "SET initial_cash = ?, updated_at = CURRENT_TIMESTAMP "
+        "WHERE strategy_id = ?",
+        (float(initial_cash), strategy_id),
+    )
+    book_row = conn.execute(
+        "SELECT * FROM virtual_books WHERE strategy_id = ?",
+        (strategy_id,),
+    ).fetchone()
+    return _row_to_virtual_book(book_row)
 
 
 def list_virtual_positions(

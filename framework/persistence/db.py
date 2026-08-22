@@ -23,10 +23,16 @@ def open_db(path: Path | str) -> sqlite3.Connection:
     a backtest thread writes) durable. We don't open across processes here —
     the Streamlit app and the 15:30 scheduler are separate processes by spec
     (CAP-7) and SQLite's locking handles that.
+
+    ``check_same_thread=False`` lets Streamlit's worker thread share the
+    same connection as the test thread (AppTest runs the page in a
+    separate worker thread). SQLite serializes access internally — for
+    a single-process MVP that's safe and simpler than per-thread
+    connections that need explicit visibility coordination via WAL.
     """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(p), isolation_level=None)
+    conn = sqlite3.connect(str(p), isolation_level=None, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")

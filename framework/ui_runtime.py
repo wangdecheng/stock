@@ -42,10 +42,13 @@ CONFIG_KEY_ACTIVE_STRATEGY = "active_strategy_id"
 def _connect(db_path: str) -> sqlite3.Connection:
     """Open the SQLite connection once per process and run migrations.
 
-    ``lru_cache`` keyed by the resolved path string so a second call with
-    the same path returns the same connection — Streamlit re-runs the
-    script on every widget change, and a fresh ``open_db()`` on each run
-    would multiply file handles and race the WAL writer.
+    ``lru_cache`` keyed on the resolved path string so a second call with
+    the same path returns the same connection. ``open_db`` sets
+    ``check_same_thread=False`` so Streamlit's worker thread can share
+    the connection with the test thread (AppTest), and SQLite
+    serializes the cross-thread access internally. ``@st.cache_resource``
+    is intentionally avoided because the testing harness wraps every
+    script run inside its own AppTest context.
     """
     conn = open_db(db_path)
     ensure_schema(conn)
@@ -59,6 +62,9 @@ def get_connection(
     avoided because the testing harness wraps every script run inside its own
     ``AppTest`` context; ``lru_cache`` keeps the conn stable across reruns
     within one process and easy to clear in tests via ``_connect.cache_clear()``.
+    ``open_db`` opens the connection with ``check_same_thread=False`` so
+    Streamlit's worker thread (AppTest) can share the same connection
+    with the test thread.
     """
     p = str(db_path) if db_path is not None else str(DEFAULT_DB_PATH)
     return _connect(p)

@@ -19,7 +19,10 @@ this module stays importable from anywhere without dragging the rest of
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 from typing import Optional
+
+from framework.persistence.repo import _parse_date
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +123,47 @@ def list_real_positions(conn: sqlite3.Connection) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Latest trade lookup (dashboard market-value / today's P&L)
+# ---------------------------------------------------------------------------
+
+
+def latest_real_trades(
+    conn: sqlite3.Connection,
+    symbols: list[str],
+) -> dict[str, dict]:
+    """For each symbol, return the most recent real-trade row's
+    ``(price, executed_at)``.
+
+    Used by the dashboard's market-value helper to mark-to-market a
+    position when today's bar hasn't been fetched yet (intraday render)
+    — i.e. it falls back to the last fill price. Returns a dict keyed by
+    symbol; symbols with no trades are omitted from the result.
+    """
+    if not symbols:
+        return {}
+    placeholders = ",".join("?" * len(symbols))
+    rows = conn.execute(
+        f"""
+        SELECT symbol, price, executed_at FROM real_trades
+        WHERE symbol IN ({placeholders})
+          AND id IN (
+            SELECT MAX(id) FROM real_trades
+            WHERE symbol IN ({placeholders})
+            GROUP BY symbol
+          )
+        """,
+        [*symbols, *symbols],
+    ).fetchall()
+    return {
+        r[0]: {"price": float(r[1]), "executed_at": _parse_date(r[2])}
+        for r in rows
+    }
+
+
 __all__ = [
     "real_position",
     "real_avg_cost",
     "list_real_positions",
+    "latest_real_trades",
 ]
