@@ -26,10 +26,12 @@ from streamlit_echarts import st_pyecharts
 from framework.charts import MarkPoint, build_kline_volume_grid
 from framework.data.adapter import (
     AKShareAdapter,
+    BarsResult,
     DataAdapterUnavailable,
     EmptyBarsError,
     UnknownSymbolError,
 )
+from framework.data.ratelimit import RateLimitExceeded
 from framework.persistence import list_suggestions
 from framework.ui_runtime import get_active_strategy_id, get_connection
 
@@ -78,11 +80,28 @@ st.title("🔎 股票详情")
 # ----- singletons ----------------------------------------------------------
 
 
-def get_adapter() -> AKShareAdapter:
-    """AKShare adapter factory — cheap, skip ``@st.cache_resource`` so tests
-    can monkeypatch ``app.get_adapter`` cleanly (mirrors the pattern in the
-    top-level ``app.py``)."""
-    return AKShareAdapter(cache_dir=Path("data/cache"))
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_bars_cached(symbol: str, start_iso: str, end_iso: str, adj: str) -> dict:
+    """Thin serializable wrapper around ``get_bars`` so Streamlit's hash-based
+    cache can memoise results across reruns.
+
+    Caches the *BarsResult* dict (df → records + source/stale fields) keyed
+    on ``(symbol, start, end, adj)``. The 60 s TTL is shorter than the
+    upstream rate-limit window (20 req/min) so the user effectively gets
+    at most one eastmoney round-trip per minute per (symbol, range, adj)
+    tuple — which is what kept the spinner pinned at 60 s+ before this
+    cache existed (every rerun repeated the full network + limiter path).
+    """
+    adapter = AKShareAdapter(cache_dir=Path("data/cache"))
+    r: BarsResult = adapter.get_bars(
+        symbol, date.fromisoformat(start_iso), date.fromisoformat(end_iso),
+        adj=adj, frequency="daily",
+    )
+    return {
+        "records": r.df.assign(date=r.df["date"].astype(str)).to_dict(orient="records"),
+        "stale_seconds": int(r.stale_seconds),
+        "source": r.source,
+    }
 
 
 _RANGE_OPTIONS: dict[str, int] = {
@@ -101,36 +120,64 @@ if "_recent_symbols" not in st.session_state:
 
 
 # ----- inputs --------------------------------------------------------------
+#
+# Inputs are inside an ``st.form`` so the user must explicitly click
+# "查询" (which is the only action that triggers a rerun). Without this,
+# the bare ``text_input`` was firing a rerun on every keystroke, each of
+# which ran the full fetch + limiter pipeline again — landing the page
+# in the cross-process rate-limit queue.
 
 
-col1, col2, col3 = st.columns([2, 2, 1])
 default_symbol = st.session_state._recent_symbols[0] if st.session_state._recent_symbols else "000001"
-symbol = col1.text_input(
-    "股票代码",
-    value=default_symbol,
-    max_chars=6,
-    help="6 位 A 股代码",
-).strip()
-range_label = col2.selectbox(
-    "时间范围",
-    options=list(_RANGE_OPTIONS.keys()),
-    index=3,  # 1Y
-)
-adj = col3.selectbox(
-    "复权",
-    options=list(_ADJ_LABELS.keys()),
-    index=0,
-    format_func=lambda x: _ADJ_LABELS[x],
-)
+
+with st.form("stock_detail_form", clear_on_submit=False):
+    col1, col2, col3, col4 = st.columns([2, 2, 1, 1])
+    symbol = col1.text_input(
+        "股票代码",
+        value=default_symbol,
+        max_chars=6,
+        help="6 位 A 股代码",
+    ).strip()
+    range_label = col2.selectbox(
+        "时间范围",
+        options=list(_RANGE_OPTIONS.keys()),
+        index=3,  # 1Y
+    )
+    adj = col3.selectbox(
+        "复权",
+        options=list(_ADJ_LABELS.keys()),
+        index=0,
+        format_func=lambda x: _ADJ_LABELS[x],
+    )
+    submitted = col4.form_submit_button("查询", width="stretch")
 
 if not symbol:
     st.info("请输入股票代码。")
+    st.stop()
+
+# Always cache the form selection so we don't lose the user's latest
+# typed-but-not-submitted input on rerun. Cheap because session_state
+# writes don't trigger fetches.
+st.session_state["_pending_symbol"] = symbol
+st.session_state["_pending_range"] = range_label
+st.session_state["_pending_adj"] = adj
+
+# Show a hint until the user actually clicks "查询"; the cache is keyed
+# on (symbol, range, adj) so once they hit the button, subsequent edits
+# to other widgets do NOT bust the cache unless the form is resubmitted.
+if not submitted:
+    last = st.session_state.get("_last_rendered_key")
+    cur = (symbol, range_label, adj)
+    if last != cur:
+        st.caption("点击「查询」加载 K 线；相同的 (代码, 范围, 复权) 组合 60 秒内会从缓存秒回。")
     st.stop()
 
 # record to recent-list (dedupe, keep last 10, newest first)
 if symbol and symbol not in st.session_state._recent_symbols:
     st.session_state._recent_symbols.insert(0, symbol)
     st.session_state._recent_symbols = st.session_state._recent_symbols[:10]
+
+st.session_state["_last_rendered_key"] = (symbol, range_label, adj)
 
 
 # ----- fetch bars ----------------------------------------------------------
@@ -139,31 +186,42 @@ if symbol and symbol not in st.session_state._recent_symbols:
 end = date.today()
 start = end - timedelta(days=_RANGE_OPTIONS[range_label])
 
-adapter = get_adapter()
-with st.spinner("拉取 K 线…"):
-    try:
-        result = adapter.get_bars(symbol, start, end, adj=adj, frequency="daily")
-    except EmptyBarsError:
-        st.error(f"AKShare 返回空数据 ({symbol} {start}–{end}, {_ADJ_LABELS[adj]})")
-        st.stop()
-    except UnknownSymbolError:
-        st.error(f"未知股票代码: {symbol!r}")
-        st.stop()
-    except DataAdapterUnavailable as exc:
-        st.error(f"网络拉取失败且无缓存:{exc}")
-        st.stop()
-    except Exception as exc:
-        # Safety net — get_bars is contracted to raise only the three above,
-        # but a future bug or an exception inside read_cache / write_cache
-        # would otherwise leave the spinner spinning forever with no
-        # feedback. Surface anything unexpected so the operator can act.
-        st.error(f"拉取 K 线时未预期异常: {type(exc).__name__}: {exc}")
-        st.stop()
+try:
+    cached = _fetch_bars_cached(symbol, start.isoformat(), end.isoformat(), adj)
+except EmptyBarsError:
+    st.error(f"AKShare 返回空数据 ({symbol} {start}–{end}, {_ADJ_LABELS[adj]})")
+    st.stop()
+except UnknownSymbolError:
+    st.error(f"未知股票代码: {symbol!r}")
+    st.stop()
+except DataAdapterUnavailable as exc:
+    st.error(f"网络拉取失败且无缓存:{exc}")
+    st.stop()
+except RateLimitExceeded as exc:
+    st.error(f"⚠️ {exc}（其他进程已用满 20 req/min 上限）")
+    st.stop()
+except Exception as exc:
+    # Safety net — the cache wrapper surfaces only the three documented
+    # exceptions + RateLimitExceeded, but a bug inside ``to_dict`` or
+    # elsewhere would otherwise leave the page silent. Surface anything.
+    st.error(f"拉取 K 线时未预期异常: {type(exc).__name__}: {exc}")
+    st.stop()
 
-if result.stale_seconds > 0:
-    st.warning(f"⚠️ 数据延迟: 来自本地缓存(共 {len(result.df)} 根 K 线)")
+# Reconstruct DataFrame from the serialized cache payload.
+source: str = cached["source"]
+stale_seconds: int = cached["stale_seconds"]
+records = cached["records"]
+df = pd.DataFrame.from_records(records)
+if "date" in df.columns:
+    df["date"] = pd.to_datetime(df["date"]).dt.date
 
-df: pd.DataFrame = result.df
+if source == "cache":
+    st.warning(f"⚠️ 数据延迟: 来自本地缓存(共 {len(df)} 根 K 线, 已 {stale_seconds}s)")
+elif source == "tencent":
+    st.info("数据来源：腾讯财经（东方财富主路失败，已自动兜底）")
+else:
+    st.info(f"数据来源：东方财富实时（{len(df)} 根 K 线）")
+
 if df.empty:
     st.info("无 K 线数据。")
     st.stop()
