@@ -164,11 +164,17 @@ class BarsResult:
 
     `stale_seconds > 0` means the result came from the parquet cache after an
     AKShare failure. The UI reads this to render the "数据延迟" badge.
+
+    `source` records which upstream served the bars: the live eastmoney
+    endpoint, the Tencent fallback (T14), or the on-disk parquet cache.
+    Default is ``"eastmoney"`` for backwards compatibility with older call
+    sites that construct ``BarsResult`` positionally without naming `source`.
     """
 
     df: pd.DataFrame
     stale_seconds: int
     cache_hit: bool
+    source: Literal["eastmoney", "tencent", "cache"] = "eastmoney"
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +212,7 @@ class AKShareAdapter:
         AKShare response, raises `EmptyBarsError` (cache NOT consulted).
         """
         try:
-            df = self._fetch_bars(symbol, start, end, adj, frequency)
+            df, source = self._fetch_bars(symbol, start, end, adj, frequency)
         except UnknownSymbolError:
             raise
         except _AKShareUnknownSymbol:
@@ -218,13 +224,13 @@ class AKShareAdapter:
                     f"AKShare failed ({type(exc).__name__}: {exc}) and no cache for {symbol}"
                 ) from exc
             age = cache_file_age_seconds(cache_path(self._cache_dir, symbol, frequency, adj))
-            return BarsResult(df=cached, stale_seconds=age, cache_hit=True)
+            return BarsResult(df=cached, stale_seconds=age, cache_hit=True, source="cache")
 
         if df is None or df.empty:
             raise EmptyBarsError(f"AKShare returned empty bars for {symbol}")
 
         write_cache(self._cache_dir, symbol, frequency, adj, df)
-        return BarsResult(df=df, stale_seconds=0, cache_hit=False)
+        return BarsResult(df=df, stale_seconds=0, cache_hit=False, source=source)
 
     # HTTP timeout for upstream AKShare calls. Eastmoney resolves to IPv6-only
     # addresses (`push2.eastmoney.com` → `push2ipv6.trafficmanager.cn`) on some
@@ -238,8 +244,14 @@ class AKShareAdapter:
 
     def _fetch_bars(
         self, symbol: str, start: date, end: date, adj: Adj, frequency: Frequency
-    ) -> pd.DataFrame | None:
-        """Call AKShare and return a normalized DataFrame (English columns).
+    ) -> tuple[pd.DataFrame | None, Literal["eastmoney", "tencent"]]:
+        """Call AKShare and return ``(DataFrame, source)``.
+
+        ``source`` is one of:
+          * ``"eastmoney"`` — primary AKShare endpoint succeeded
+          * ``"tencent"``  — eastmoney raised, Tencent fallback succeeded
+          *  ``None``      — both upstreams raised or returned empty (caller
+            raises / falls through to cache)
 
         Eastmoney is the primary source. On exception, fall back to Tencent
         (`ak.stock_zh_a_hist_tx`) for daily frequency — Tencent is reachable
@@ -263,7 +275,7 @@ class AKShareAdapter:
                     adjust="" if adj == "none" else adj,
                     timeout=timeout,
                 )
-                return _normalize(df, _DAILY_COLUMN_MAP)
+                return _normalize(df, _DAILY_COLUMN_MAP), "eastmoney"
             # minute / minute-em endpoint. NOTE: this function does NOT
             # expose a `timeout` kwarg in the installed akshare version, so
             # the upstream may hang indefinitely on a broken route. The
@@ -278,7 +290,7 @@ class AKShareAdapter:
                 end_date=end.strftime("%Y-%m-%d") + " 15:00:00",
                 adjust="" if adj == "none" else adj,
             )
-            return _normalize(df, _MINUTE_COLUMN_MAP)
+            return _normalize(df, _MINUTE_COLUMN_MAP), "eastmoney"
         except Exception as eastmoney_exc:
             # Eastmoney unreachable / refused (e.g. egress IP is WAF-flagged).
             # Try Tencent — daily only; minute frequencies have no fallback.
@@ -292,9 +304,11 @@ class AKShareAdapter:
                 raise eastmoney_exc from tx_exc
             if tx_df is None or tx_df.empty:
                 # Tencent doesn't recognize the symbol; let the caller treat
-                # this as an empty response.
-                return tx_df
-            return tx_df
+                # this as an empty response. Source is "tencent" because that
+                # is where the empty response came from — useful for UI when
+                # we want to surface "eastmoney blocked + tencent empty".
+                return tx_df, "tencent"
+            return tx_df, "tencent"
 
     # ----- fundamentals --------------------------------------------------
 

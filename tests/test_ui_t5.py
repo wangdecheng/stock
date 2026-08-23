@@ -229,11 +229,18 @@ def test_stock_detail_renders_kline_with_mock_adapter(temp_db):
     from framework.data.adapter import AKShareAdapter, BarsResult
 
     df = _make_bars_df(60)
-    success = BarsResult(df=df, stale_seconds=0, cache_hit=False)
+    success = BarsResult(df=df, stale_seconds=0, cache_hit=False, source="eastmoney")
     with patch.object(AKShareAdapter, "get_bars", return_value=success, autospec=True):
-        at = _boot_app("pages/1_股票详情.py")
-        # Symbol input pre-populated; no need to click — the page fetches on render.
-        # AppTest runs the script once; the gate is "no exception".
+        at = AppTest.from_file("pages/1_股票详情.py", default_timeout=30)
+        at.run()
+        assert not at.exception, [str(e.value) for e in at.exception]
+        # Submit the 查询 form to trigger the (cached) fetch path. Without
+        # this click the page stops at the "点击「查询」加载 K 线" caption.
+        submit = at.get("form_submit_button")
+        # AppTest exposes form_submit_button via .button when inside a form
+        submit_btn = next(b for b in at.button if b.label == "查询")
+        submit_btn.click()
+        at.run()
         assert not at.exception, [str(e.value) for e in at.exception]
 
 
@@ -241,7 +248,12 @@ def test_stock_detail_handles_empty_bars(temp_db):
     from framework.data.adapter import AKShareAdapter, EmptyBarsError
 
     with patch.object(AKShareAdapter, "get_bars", side_effect=EmptyBarsError("empty"), autospec=True):
-        at = _boot_app("pages/1_股票详情.py")
+        at = AppTest.from_file("pages/1_股票详情.py", default_timeout=30)
+        at.run()
+        # Click 查询 to actually invoke the fetch path.
+        submit_btn = next(b for b in at.button if b.label == "查询")
+        submit_btn.click()
+        at.run()
         errs = [e.value for e in at.error]
         assert any("AKShare 返回空数据" in e for e in errs), errs
 

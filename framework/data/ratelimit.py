@@ -32,6 +32,17 @@ from typing import Callable, TypeVar
 F = TypeVar("F", bound=Callable[..., object])
 
 
+class RateLimitExceeded(Exception):
+    """Raised when ``ratelimit.acquire(timeout=...)`` exhausts its wait budget.
+
+    The caller (page / engine) decides whether to surface this to the user
+    or silently fall back to a stale-cache path. We used to block forever
+    (``acquire(timeout=None)``), which left ``st.spinner`` spinning until
+    upstream rate-limit windows aged out — typically ~60 s, which is what
+    the stock-detail page was exhibiting in production.
+    """
+
+
 # ---------------------------------------------------------------------------
 # TokenBucket — primitive, kept available for non-strict use cases
 # ---------------------------------------------------------------------------
@@ -156,13 +167,35 @@ class SlidingWindowLimiter:
 GLOBAL_LIMITER = SlidingWindowLimiter(max_calls=20, window_seconds=60.0)
 
 
+# Hard cap on how long ``ratelimit`` will block waiting for a slot. Without
+# this bound, a saturated limiter blocks forever (the original
+# ``timeout=None`` default) and the page spinner is stuck until the oldest
+# in-window timestamp ages out — observed as a steady 60 s+ on the stock
+# detail page when other processes had already eaten the quota.
+#
+# 30 s leaves room for two full upstream timeouts (eastmoney + Tencent, each
+# 10 s) while still surfacing a useful error to the UI. Pages opt to either
+# show a "rate-limited, try again in N seconds" warning or transparently
+# fall back to the parquet cache (the latter requires the caller to inspect
+# the exception and re-shape the request).
+RATELIMIT_ACQUIRE_TIMEOUT_SECONDS = 30.0
+
+
 def ratelimit(func: F) -> F:
     """Decorator that blocks on the global sliding-window limiter before
     invoking ``func``. Works on plain functions and bound/unbound methods.
+
+    Raises ``RateLimitExceeded`` if no slot becomes available within
+    ``RATELIMIT_ACQUIRE_TIMEOUT_SECONDS`` so callers can decide whether to
+    surface a warning or fall back to stale data.
     """
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        GLOBAL_LIMITER.acquire()
+        if not GLOBAL_LIMITER.acquire(timeout=RATELIMIT_ACQUIRE_TIMEOUT_SECONDS):
+            raise RateLimitExceeded(
+                f"upstream rate limit (20 req/min) not released within "
+                f"{RATELIMIT_ACQUIRE_TIMEOUT_SECONDS:.0f}s; try again later"
+            )
         return func(*args, **kwargs)
 
     return wrapper  # type: ignore[return-value]

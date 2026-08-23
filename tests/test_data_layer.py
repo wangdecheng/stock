@@ -38,6 +38,8 @@ from framework.data.cache import (
 from framework.data.ratelimit import (
     GLOBAL_BUCKET,
     GLOBAL_LIMITER,
+    RateLimitExceeded,
+    RATELIMIT_ACQUIRE_TIMEOUT_SECONDS,
     SlidingWindowLimiter,
     TokenBucket,
     ratelimit,
@@ -169,6 +171,40 @@ class TestRatelimitDecorator:
         first_100ms = sum(1 for t in timestamps if t <= timestamps[0] + 0.1)
         assert first_100ms >= 10, f"expected fast burst, only {first_100ms} in 100ms"
 
+    def test_raises_rate_limit_exceeded_when_window_stays_full(self, monkeypatch):
+        """When the sliding window is full and the next slot will not free
+        up within ``RATELIMIT_ACQUIRE_TIMEOUT_SECONDS``, ``@ratelimit`` must
+        raise :class:`RateLimitExceeded` instead of blocking forever — pages
+        rely on the exception to surface a useful message and free the
+        Streamlit spinner.
+        """
+        # Window of 60 s with capacity 1, so the second call would block
+        # ~60 s for the first to age out. With timeout=0.05 s, it must raise.
+        saturated = SlidingWindowLimiter(max_calls=1, window_seconds=60.0)
+        monkeypatch.setattr(
+            "framework.data.ratelimit.GLOBAL_LIMITER", saturated, raising=True
+        )
+        monkeypatch.setattr(
+            "framework.data.ratelimit.RATELIMIT_ACQUIRE_TIMEOUT_SECONDS",
+            0.05,
+            raising=True,
+        )
+
+        @ratelimit
+        def f():
+            return 1
+
+        assert f() == 1  # first call: slot 1/1
+        with pytest.raises(RateLimitExceeded, match="upstream rate limit"):
+            f()  # second call: window saturated → timeout → raise
+
+    def test_acquire_timeout_constant_is_a_finite_bound(self):
+        # The constant must be set so the page-side flow can assume an
+        # upper bound on spinner dwell time.
+        assert isinstance(RATELIMIT_ACQUIRE_TIMEOUT_SECONDS, float)
+        assert RATELIMIT_ACQUIRE_TIMEOUT_SECONDS > 0
+        assert RATELIMIT_ACQUIRE_TIMEOUT_SECONDS <= 60.0
+
 
 # ---------------------------------------------------------------------------
 # Parquet cache
@@ -208,7 +244,9 @@ class TestAKShareAdapter:
         self, adapter_with_cache, monkeypatch, tmp_path
     ):
         df = _make_bars_df()
-        monkeypatch.setattr(adapter_with_cache, "_fetch_bars", lambda *a, **kw: df)
+        monkeypatch.setattr(
+            adapter_with_cache, "_fetch_bars", lambda *a, **kw: (df, "eastmoney")
+        )
 
         result = adapter_with_cache.get_bars(
             "000001", date(2024, 1, 1), date(2024, 1, 5)
@@ -242,7 +280,7 @@ class TestAKShareAdapter:
         # Even with cache present, empty upstream must raise (not silently cache)
         write_cache(tmp_path, "000001", "daily", "qfq", _make_bars_df())
         monkeypatch.setattr(
-            adapter_with_cache, "_fetch_bars", lambda *a, **kw: None
+            adapter_with_cache, "_fetch_bars", lambda *a, **kw: (None, "eastmoney")
         )
 
         with pytest.raises(EmptyBarsError):
@@ -254,7 +292,8 @@ class TestAKShareAdapter:
         self, adapter_with_cache, monkeypatch
     ):
         monkeypatch.setattr(
-            adapter_with_cache, "_fetch_bars", lambda *a, **kw: pd.DataFrame()
+            adapter_with_cache, "_fetch_bars",
+            lambda *a, **kw: (pd.DataFrame(), "eastmoney"),
         )
         with pytest.raises(EmptyBarsError):
             adapter_with_cache.get_bars(

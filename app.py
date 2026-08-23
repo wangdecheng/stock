@@ -176,45 +176,68 @@ def _latest_equity_cached(_active: str | None) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_realtime_prices_cached(symbols: tuple[str, ...]) -> dict[str, float]:
+    """Best-effort latest mark-to-market prices for a symbol set.
+
+    Reads go through ``AKShareAdapter.get_bars`` (which has its own
+    @ratelimit-decorated window of 20 req/min). Caching the network calls
+    here — keyed on the *sorted symbol tuple* — keeps the dashboard from
+    spending the whole rate budget on rerenders: 10 holdings × N widget
+    jitters / page reload was observed as a steady 60 s spinner before
+    ``st.cache_data`` was introduced.
+
+    Network errors are swallowed per-symbol so a single AKShare outage
+    doesn't blank the whole table; the caller can fall back to the last
+    real-trade price or to avg_cost.
+    """
+    if not symbols:
+        return {}
+    from framework.data.adapter import AKShareAdapter  # lazy: keep app import-graph minimal
+    adapter = AKShareAdapter(cache_dir=Path("data/cache"))
+    end = date.today()
+    start = end - timedelta(days=10)
+    out: dict[str, float] = {}
+    for sym in symbols:
+        try:
+            result = adapter.get_bars(sym, start, end, adj="qfq", frequency="daily")
+        except Exception:
+            continue
+        if result.df.empty:
+            continue
+        try:
+            out[sym] = float(result.df["close"].iloc[-1])
+        except Exception:
+            continue
+    return out
+
+
 def _fetch_latest_prices(
     symbols: list[str],
     *,
     fallback_prices: dict[str, float],
 ) -> dict[str, tuple[float, str]]:
-    """Best-effort mark-to-market price lookup for the dashboard.
+    """Mark-to-market price lookup for the dashboard.
 
-    Order of preference:
+    Order of preference (returned with a ``source_label``):
       1. AKShare's most recent close from a 5-day window.
+         — read via :func:`fetch_realtime_prices_cached` to skip the
+           upstream rate-limit wall on subsequent renders.
       2. ``fallback_prices[symbol]`` (the latest real-trade price).
       3. ``None`` — caller can fall back to avg_cost.
 
-    Network errors are swallowed: missing today's bar ≠ crash the page.
-    Returns ``{symbol: (price, source_label)}``.
+    Network errors are handled inside the cached helper; this function
+    just stitches the realtime and fallback views together. Returns
+    ``{symbol: (price, source_label)}``.
     """
     if not symbols:
         return {}
+    realtime = fetch_realtime_prices_cached(tuple(sorted(symbols)))
     out: dict[str, tuple[float, str]] = {}
-    try:
-        from framework.data.adapter import AKShareAdapter, EmptyBarsError  # noqa: F401
-    except Exception:
-        for sym in symbols:
-            fb = fallback_prices.get(sym)
-            if fb is not None:
-                out[sym] = (float(fb), "latest_trade")
-        return out
-    adapter = AKShareAdapter(cache_dir=Path("data/cache"))
-    end = date.today()
-    start = end - timedelta(days=10)
     for sym in symbols:
-        try:
-            result = adapter.get_bars(sym, start, end, adj="qfq", frequency="daily")
-            if result.df.empty:
-                continue
-            last_close = float(result.df["close"].iloc[-1])
-            out[sym] = (last_close, "akshare")
+        if sym in realtime:
+            out[sym] = (float(realtime[sym]), "akshare")
             continue
-        except Exception:
-            pass
         fb = fallback_prices.get(sym)
         if fb is not None:
             out[sym] = (float(fb), "latest_trade")
