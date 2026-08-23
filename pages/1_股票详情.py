@@ -33,6 +33,10 @@ from framework.data.adapter import (
 from framework.persistence import list_suggestions
 from framework.ui_runtime import get_active_strategy_id, get_connection
 
+# NOTE: get_fundamentals is intentionally not called from this page. PE/PB/股息率
+# were removed (user feedback: not needed; sidebar data sources were unreliable).
+# The adapter method is kept on AKShareAdapter for future use.
+
 
 # ---------------------------------------------------------------------------
 # helpers (defined up-front so pyflakes sees them before use; the script
@@ -148,6 +152,13 @@ with st.spinner("拉取 K 线…"):
     except DataAdapterUnavailable as exc:
         st.error(f"网络拉取失败且无缓存:{exc}")
         st.stop()
+    except Exception as exc:
+        # Safety net — get_bars is contracted to raise only the three above,
+        # but a future bug or an exception inside read_cache / write_cache
+        # would otherwise leave the spinner spinning forever with no
+        # feedback. Surface anything unexpected so the operator can act.
+        st.error(f"拉取 K 线时未预期异常: {type(exc).__name__}: {exc}")
+        st.stop()
 
 if result.stale_seconds > 0:
     st.warning(f"⚠️ 数据延迟: 来自本地缓存(共 {len(result.df)} 根 K 线)")
@@ -212,28 +223,6 @@ grid = build_kline_volume_grid(
     hold_pts=hold_pts,
 )
 st_pyecharts(grid, height="600px")
-
-
-# ----- financials sidebar --------------------------------------------------
-
-
-with st.sidebar:
-    st.subheader("财务摘要")
-    try:
-        fund = adapter.get_fundamentals(symbol)
-    except Exception as exc:
-        st.caption(f"获取失败:{exc}")
-        fund = None
-    if fund is not None:
-        st.metric("PE", f"{fund['pe']:.2f}" if fund["pe"] is not None else "—")
-        st.metric("PB", f"{fund['pb']:.2f}" if fund["pb"] is not None else "—")
-        st.metric(
-            "股息率",
-            f"{fund['dividend_yield'] * 100:.2f}%" if fund["dividend_yield"] is not None else "—",
-        )
-
-    st.divider()
-    st.caption("「添加到自选」按钮因 SPEC 开放问题 #1 暂未启用。")
 
 
 # ----- "Add to universe" placeholder ---------------------------------------

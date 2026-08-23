@@ -97,13 +97,15 @@ class Context:
             )
         end = self.now
         start = end - timedelta(days=lookback)
+        # `lookback` is already encoded into `start` above; no need to forward
+        # it to the adapter (whose contract is `(symbol, start, end, **kwargs)`
+        # but whose concrete `AKShareAdapter` signature doesn't accept it).
         result = self.adapter.get_bars(
             symbol,
             start,
             end,
             adj="qfq",
             frequency="daily",
-            lookback=lookback,
         )
         # Adapter returns BarsResult (or any object exposing .df).
         return result.df

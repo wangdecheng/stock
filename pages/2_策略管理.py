@@ -86,11 +86,19 @@ def _render_param_widget(
     if annotation is bool or annotation == "bool":
         return bool(st.checkbox(label, value=bool(default), key=key))
     # Unsupported type — fall back to JSON text so the user can still set it.
-    text = st.text_input(
-        f"{label} (JSON)",
-        value=json.dumps(default, ensure_ascii=False) if default is not None else "null",
-        key=key,
-    )
+    if default is None:
+        initial_json = "null"
+    else:
+        try:
+            initial_json = json.dumps(default, ensure_ascii=False)
+        except TypeError:
+            # Non-serializable default (e.g. a class, a callable). Don't
+            # crash the page — start with an empty JSON buffer and warn.
+            initial_json = ""
+            st.warning(
+                f"{pname} 的默认值不可 JSON 序列化,已留空。请手动填入合法 JSON。"
+            )
+    text = st.text_input(f"{label} (JSON)", value=initial_json, key=key)
     try:
         return json.loads(text)
     except Exception:
@@ -216,6 +224,11 @@ for name, cls in registry.items():
         new_params: dict[str, Any] = {}
         for pname, param in sig.parameters.items():
             if pname == "self":
+                continue
+            # ``**kwargs`` / ``*args`` are structural catch-alls, not user-
+            # facing parameters; rendering a JSON widget for them would
+            # try to ``json.dumps(inspect._empty)`` and blow up.
+            if param.kind in (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL):
                 continue
             default = existing_params.get(pname, param.default)
             annotation = param.annotation

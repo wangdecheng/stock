@@ -226,6 +226,16 @@ class AKShareAdapter:
         write_cache(self._cache_dir, symbol, frequency, adj, df)
         return BarsResult(df=df, stale_seconds=0, cache_hit=False)
 
+    # HTTP timeout for upstream AKShare calls. Eastmoney resolves to IPv6-only
+    # addresses (`push2.eastmoney.com` → `push2ipv6.trafficmanager.cn`) on some
+    # networks; if the host has no IPv6 egress the TCP SYN hangs forever and
+    # `requests` (which AKShare uses under the hood) defaults to
+    # `timeout=None`. Without an explicit timeout, the page spinner hangs with
+    # no exception to catch — the call simply never returns. 10 s is generous
+    # for eastmoney (~1 s normally) and short enough that the Tencent fallback
+    # or cache fallback kicks in within a tolerable UX budget.
+    _UPSTREAM_TIMEOUT_SECONDS = 10.0
+
     def _fetch_bars(
         self, symbol: str, start: date, end: date, adj: Adj, frequency: Frequency
     ) -> pd.DataFrame | None:
@@ -242,6 +252,7 @@ class AKShareAdapter:
         # Import only here — keeps the rest of the codebase akshare-free.
         import akshare as ak
 
+        timeout = self._UPSTREAM_TIMEOUT_SECONDS
         try:
             if frequency == "daily":
                 df = ak.stock_zh_a_hist(
@@ -250,9 +261,15 @@ class AKShareAdapter:
                     start_date=start.strftime("%Y%m%d"),
                     end_date=end.strftime("%Y%m%d"),
                     adjust="" if adj == "none" else adj,
+                    timeout=timeout,
                 )
                 return _normalize(df, _DAILY_COLUMN_MAP)
-            # minute / minute-em endpoint
+            # minute / minute-em endpoint. NOTE: this function does NOT
+            # expose a `timeout` kwarg in the installed akshare version, so
+            # the upstream may hang indefinitely on a broken route. The
+            # outer `get_bars` catches `Exception` and falls through to the
+            # parquet cache; minute-level coverage is rare on this app and
+            # the cache mitigates the worst case.
             period_str = _FREQ_TO_AKSHARE_PERIOD[frequency]
             df = ak.stock_zh_a_hist_min_em(
                 symbol=symbol,
@@ -283,57 +300,41 @@ class AKShareAdapter:
 
     @ratelimit
     def get_fundamentals(self, symbol: str) -> dict[str, Any]:
-        """Return at least `pe` / `pb` / `dividend_yield` keys.
+        """Return ``{pe, pb, dividend_yield}`` for ``symbol``.
 
-        Best-effort: each upstream call is wrapped in try/except. If a metric
-        is unavailable, the value is `None` but the key is always present.
-        Raises `UnknownSymbolError` only when AKShare definitively rejects the
-        symbol (no fallback cache for fundamentals).
+        Per-symbol only: PE/PB come from ``stock_a_indicator_lg``. Dividend
+        yield is intentionally left as ``None`` — fetching it would require
+        either ``stock_zh_a_spot_em`` (entire 5000+ row A-share table) or a
+        derived computation over ``stock_history_dividend`` × current close,
+        neither of which the MVP needs.
+
+        Exceptions are NOT swallowed — network failures, AKShare errors, and
+        missing functions all surface so the UI can show the real cause. Only
+        per-cell type coercion (string → float) is wrapped, since a single
+        malformed cell shouldn't fail the whole metric. Raises
+        ``UnknownSymbolError`` if the upstream returns empty.
         """
         import akshare as ak
 
-        result: dict[str, Any] = {"pe": None, "pb": None, "dividend_yield": None}
-
-        # PE / PB from long-term indicator source
-        try:
-            df = ak.stock_a_indicator_lg(symbol=symbol)
-            if df is not None and not df.empty:
-                latest = df.iloc[-1]
-                for src_key, dst_key in (("pe", "pe"), ("pb", "pb")):
-                    if src_key in df.columns:
-                        v = latest[src_key]
-                        if pd.notna(v):
-                            try:
-                                result[dst_key] = float(v)
-                            except (TypeError, ValueError):
-                                pass
-        except Exception:
-            pass
-
-        # Dividend yield: try the spot-quote source which carries 股息率.
-        # NOTE: this fetches the entire A-share spot table once; for MVP this
-        # is acceptable (called once per page view, not per bar). If this
-        # becomes a hotspot we should switch to a per-symbol call.
-        try:
-            spot = ak.stock_zh_a_spot_em()
-            if spot is not None and not spot.empty and "代码" in spot.columns:
-                row = spot[spot["代码"] == symbol]
-                if not row.empty and "股息率" in spot.columns:
-                    v = row.iloc[0]["股息率"]
-                    if pd.notna(v):
-                        try:
-                            result["dividend_yield"] = float(v)
-                        except (TypeError, ValueError):
-                            pass
-        except Exception:
-            pass
-
-        # If we got nothing useful at all, treat as unknown symbol
-        if all(v is None for v in result.values()):
+        df = ak.stock_a_indicator_lg(symbol=symbol)
+        if df is None or df.empty:
             raise UnknownSymbolError(
                 f"no fundamentals available for {symbol!r} (AKShare returned empty)"
             )
 
+        latest = df.iloc[-1]
+        result: dict[str, Any] = {"pe": None, "pb": None, "dividend_yield": None}
+        for src_key, dst_key in (("pe", "pe"), ("pb", "pb")):
+            if src_key in df.columns:
+                v = latest[src_key]
+                if pd.notna(v):
+                    try:
+                        result[dst_key] = float(v)
+                    except (TypeError, ValueError):
+                        # Single malformed cell — keep the metric as None
+                        # rather than fail the whole call. Other metrics
+                        # in the same response still surface.
+                        pass
         return result
 
     # ----- calendar ------------------------------------------------------
@@ -403,6 +404,9 @@ def _fetch_bars_tx(
     expose share-count volume. We approximate `volume` from `amount / close`
     so the volume sub-chart and OBV indicator keep working. Precision is
     approximate (uses close instead of VWAP) but visually equivalent.
+
+    `timeout=10.0` mirrors the eastmoney wall in `AKShareAdapter._fetch_bars`
+    so a Tencent-side hang also fails fast (the cache fallback then kicks in).
     """
     import akshare as ak
 
@@ -411,6 +415,7 @@ def _fetch_bars_tx(
         start_date=start.strftime("%Y-%m-%d"),
         end_date=end.strftime("%Y-%m-%d"),
         adjust="" if adj == "none" else adj,
+        timeout=10.0,
     )
     if df is None or df.empty:
         return df

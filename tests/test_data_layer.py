@@ -314,7 +314,10 @@ class TestFetchBarsTx:
     def _stub_akshare_tx(self, monkeypatch, df):
         """Patch `ak.stock_zh_a_hist_tx` at the akshare module level so it
         works regardless of where the adapter imports `ak`."""
-        def _fake(symbol, start_date, end_date, adjust):
+        def _fake(symbol, start_date, end_date, adjust, timeout=None):
+            # The adapter passes timeout=10.0 for hang protection. Tests don't
+            # need to act on it; just accept the kwarg so the fake matches
+            # the real AKShare signature (akshare 1.18.x+).
             assert adjust == "qfq"
             assert symbol.startswith(("sh", "sz"))
             return df
@@ -436,7 +439,7 @@ class TestEastmoneyToTencentFallback:
 
         import akshare
 
-        def _fake_eastmoney(symbol, period, start_date, end_date, adjust):
+        def _fake_eastmoney(symbol, period, start_date, end_date, adjust, timeout=None):
             raise ConnectionError("eastmoney WAF-blocked")
 
         monkeypatch.setattr(akshare, "stock_zh_a_hist", _fake_eastmoney, raising=False)
@@ -461,7 +464,7 @@ class TestEastmoneyToTencentFallback:
 
         import akshare
 
-        def _fake_eastmoney(symbol, period, start_date, end_date, adjust):
+        def _fake_eastmoney(symbol, period, start_date, end_date, adjust, timeout=None):
             raise ConnectionError("eastmoney WAF-blocked")
 
         monkeypatch.setattr(akshare, "stock_zh_a_hist", _fake_eastmoney, raising=False)

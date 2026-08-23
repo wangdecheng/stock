@@ -35,3 +35,7 @@ strategies/*.state.json
 
 # Per-run backtest output (T07 batch runner writes JSON here)
 reports/
+
+# Project-level environment overrides (loaded by bin/start*.sh before
+# venv activation). Copy .env.example to .env and fill in.
+.env
