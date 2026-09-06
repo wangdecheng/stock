@@ -370,6 +370,134 @@ class AdxBbRegimeStrategy:
         ctx.state["current_state"] = new_state
         return {symbol: weight}
 
+    # ----- state replay (T09 — stock-detail chart overlays, ADR-0007) ------
+
+    @staticmethod
+    def _new_state_series(
+        df: pd.DataFrame,
+        *,
+        adx_df: pd.DataFrame,
+        ma20: pd.Series,
+        ma60: pd.Series,
+        bb_mid: pd.Series,
+        hysteresis_days: int = 2,
+    ) -> pd.Series:
+        """Replay the post-Hysteresis-Gate TrendState for every bar.
+
+        Per CONTEXT.md the StateMachine emits one of four ``TrendState``
+        values (``TREND_UP / TREND_DOWN / RANGE_BULL / RANGE_BEAR``);
+        ``generate()`` persists the post-gate value as
+        ``ctx.state["current_state"]``. This replay produces the same
+        per-bar value ``generate()`` would write, used by the
+        stock-detail chart's TrendState background band (T09 / ADR-0007).
+
+        Bar-by-bar closed-form:
+
+          * For each bar ``i``, run the D3 cascade on ``(adx_df, ma20,
+            ma60).iloc[i]`` to get the cascade candidate TrendState.
+          * If the candidate is ``"TREND_UP"``, walk back through the
+            trailing bars (capped at ``hysteresis_days``) counting how
+            many also classify as TREND_UP. The Hysteresis Gate fires
+            when ``n_consecutive >= hysteresis_days`` AND today's
+            close exceeds the BB mid; otherwise the value falls back
+            to ``"RANGE_BEAR"`` (D3 default-weight-0 fallback).
+          * Otherwise the value equals the cascade candidate.
+
+        Bars where the cascade inputs are NaN (warmup window) fall
+        through the cascade's else branch to ``"RANGE_BEAR"`` —
+        matches what ``generate()`` would write, since ``NaN > 25``,
+        ``NaN < 20``, ``NaN > ma20`` all evaluate to False.
+
+        Phased Exit (T05) is intentionally NOT replayed: the chart
+        shows the TrendState the strategy actually persists, not the
+        intermediate ramp value.
+        """
+        n = len(df)
+        states: list[str] = []
+        for i in range(n):
+            adx_val = float(adx_df["adx"].iloc[i])
+            plus_di = float(adx_df["plus_di"].iloc[i])
+            minus_di = float(adx_df["minus_di"].iloc[i])
+            close = float(df["close"].iloc[i])
+            ma20_i = float(ma20.iloc[i])
+            ma60_i = float(ma60.iloc[i])
+            bb_mid_i = float(bb_mid.iloc[i])
+
+            candidate = AdxBbRegimeStrategy._classify(
+                adx_val, plus_di, minus_di, close, ma20_i, ma60_i
+            )
+
+            if candidate == "TREND_UP":
+                # Walk back up to ``hysteresis_days - 1`` bars counting
+                # how many of them ALSO classify as TREND_UP. Today
+                # counts as 1.
+                count = 1
+                max_back = hysteresis_days - 1
+                for back in range(1, max_back + 1):
+                    j = i - back
+                    if j < 0:
+                        break
+                    prev_state = AdxBbRegimeStrategy._classify(
+                        float(adx_df["adx"].iloc[j]),
+                        float(adx_df["plus_di"].iloc[j]),
+                        float(adx_df["minus_di"].iloc[j]),
+                        float(df["close"].iloc[j]),
+                        float(ma20.iloc[j]),
+                        float(ma60.iloc[j]),
+                    )
+                    if prev_state != "TREND_UP":
+                        break
+                    count += 1
+
+                if count >= hysteresis_days and close > bb_mid_i:
+                    states.append("TREND_UP")
+                else:
+                    states.append("RANGE_BEAR")
+            else:
+                states.append(candidate)
+
+        return pd.Series(states, index=df.index, name="current_state")
+
+    @staticmethod
+    def _run_halved_stage_series(
+        close: pd.Series,
+        ma10: pd.Series,
+        ma20: pd.Series,
+        *,
+        initial_stage: str = "full",
+    ) -> pd.Series:
+        """Replay the T04 HalvedStage machine for every bar.
+
+        Per CONTEXT.md, ``HalvedStage`` is the three-sub-state machine
+        inside TREND_UP: ``full → halved → cleared``. Transitions
+        fire on strict ``<``:
+
+            full      → halved   when Close < MA20
+            halved    → cleared  when Close < MA10 (post-half)
+            cleared   → cleared  (terminal; no recovery)
+
+        ``initial_stage`` defaults to ``"full"`` to mirror
+        ``ctx.state.setdefault("trend_up_stage", "full")`` in
+        ``generate()`` (T04 cold-start rule). Bars before any
+        transition stay ``"full"``.
+
+        NaN inputs (warmup) cannot fire a transition because
+        ``NaN < x`` is False — the early bars stay at their starting
+        stage, matching the strategy's behaviour on a fresh series.
+        """
+        stages: list[str] = []
+        current = initial_stage
+        for c, m10, m20 in zip(close.tolist(), ma10.tolist(), ma20.tolist()):
+            if current == "full":
+                if c < m20:
+                    current = "halved"
+            elif current == "halved":
+                if c < m10:
+                    current = "cleared"
+            # else: cleared — no transitions out.
+            stages.append(current)
+        return pd.Series(stages, index=close.index, name="trend_up_stage")
+
     # ----- helpers --------------------------------------------------------
 
     @staticmethod
@@ -604,3 +732,12 @@ class AdxBbRegimeStrategy:
 
 
 __all__ = ["AdxBbRegimeStrategy"]
+
+
+# Module-level aliases for the two state-replay pure functions.
+# They are static methods on ``AdxBbRegimeStrategy`` (so callers can
+# reach them via the class for documentation / discoverability), but
+# tests and the stock-detail page import them at module scope to keep
+# call sites short and to signal "pure utility, no instance needed".
+_new_state_series = AdxBbRegimeStrategy._new_state_series
+_run_halved_stage_series = AdxBbRegimeStrategy._run_halved_stage_series

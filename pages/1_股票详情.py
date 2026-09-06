@@ -4,13 +4,27 @@ Per ``ui-pages.md``:
   - Symbol picker (text input + recent-view dropdown via session_state)
   - K-line + MarkPoint buy/sell markers from past ``strategy_suggestions``
     for this symbol, rendered via ``framework.charts.mark_point_data``
-  - Volume sub-chart via Pyecharts ``Grid`` (built by ``framework.charts``)
-  - Financials sidebar (PE/PB/分位/分红) via ``DataAdapter.get_fundamentals``
+  - Indicator overlays (MA20/MA60, Bollinger Bands, ADX, RSI) on a
+    3-panel Grid via ``framework.charts.build_indicator_grid`` (T09)
+  - State-replay color bands: TrendState (4 colors under K-line) and
+    HalvedStage (3 colors under ADX panel), computed inside
+    ``build_indicator_grid`` so the page never imports the strategy
+    module directly (ADR-0007 single-entry-point rule).
   - "Add to universe" placeholder button (gated by SPEC Open Question #1)
 
 Charts: Pyecharts + ``streamlit_echarts`` ONLY (per T10). The chart
 construction itself lives in ``framework.charts`` — this page is only
-responsible for wiring signals to it.
+responsible for wiring signals + the active-strategy instance to it.
+
+Indicator parameter source (ADR-0007 / T09)
+-------------------------------------------
+The chart reads ``adx_len / bb_len / bb_std / rsi_len`` off the
+``AdxBbRegimeStrategy`` instance we hand it (when one is active).
+``MA20 / MA60 / MA10`` are D3 cascade constants per CONTEXT.md — they
+are NOT strategy parameters, so they are hard-coded in the chart
+module. If the active strategy is not ADX+BB (e.g. a future strategy
+without these indicators), ``build_indicator_grid`` falls back to the
+documented defaults and skips the state-replay bands.
 """
 
 from __future__ import annotations
@@ -23,7 +37,7 @@ import pandas as pd
 import streamlit as st
 from streamlit_echarts import st_pyecharts
 
-from framework.charts import MarkPoint, build_kline_volume_grid
+from framework.charts import MarkPoint, build_indicator_grid
 from framework.data.adapter import (
     AKShareAdapter,
     BarsResult,
@@ -75,7 +89,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🔎 股票详情")
+st.markdown("#### 🔎 股票详情")
 
 # ----- singletons ----------------------------------------------------------
 
@@ -269,18 +283,54 @@ if active_id is not None:
             bucket.append(marker)
 
 
-# ----- k-line + volume (Grid) ----------------------------------------------
+# ----- indicator overlays (T09 — ADR-0006 / ADR-0007) --------------------
+#
+# Per ADR-0007 Consequences #3, the chart module is the single entry point
+# into the indicator / strategy world. This page passes the active
+# strategy instance + df + MarkPoint signals and lets ``build_indicator_grid``
+# own every indicator computation + state-replay decision.
 
 
-grid = build_kline_volume_grid(
+def _load_active_strategy_instance(active_id: Optional[str]):
+    """Return a default-constructed instance of the active strategy, or
+    ``None`` when no strategy is active / the discovery fails.
+
+    The instance carries the indicator parameters the chart needs
+    (``adx_len / bb_len / bb_std / rsi_len``); handing the instance
+    rather than a parameter dict keeps the contract future-proof —
+    if a new strategy adds new parameters, ``build_indicator_grid``
+    pulls them off the instance with ``getattr`` fallback.
+    """
+    if active_id is None:
+        return None
+    try:
+        from framework.strategy.discover import discover_strategies
+
+        registry = discover_strategies()
+        cls = registry.get(active_id)
+    except Exception:
+        return None
+    if cls is None:
+        return None
+    try:
+        return cls()
+    except Exception:
+        return None
+
+
+strategy_instance = _load_active_strategy_instance(active_id)
+
+
+grid = build_indicator_grid(
     df,
     symbol=symbol,
     adj_label=_ADJ_LABELS[adj],
+    strategy_instance=strategy_instance,
     buy_pts=buy_pts,
     sell_pts=sell_pts,
     hold_pts=hold_pts,
 )
-st_pyecharts(grid, height="600px")
+st_pyecharts(grid, height="820px")
 
 
 # ----- "Add to universe" placeholder ---------------------------------------

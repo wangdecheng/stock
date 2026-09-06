@@ -274,3 +274,152 @@ def test_build_kline_volume_grid_forwards_buy_sell_to_kline(sample_ohlcv):
     kline_series = next(s for s in grid.options["series"] if s["type"] == "candlestick")
     data = kline_series["markPoint"].opts["data"]
     assert len(data) == 2
+
+
+# ---------------------------------------------------------------------------
+# Indicator-overlay constants (T09 — ADR-0006)
+# ---------------------------------------------------------------------------
+
+
+def test_trend_state_colors_pins_four_states():
+    """ADR-0006 pins the 4 TrendState colors. Test guards against silent
+    drift away from the agreed palette (pale red / green / yellow / grey)."""
+    from framework.charts import TREND_STATE_COLORS
+
+    assert set(TREND_STATE_COLORS) == {
+        "TREND_UP", "TREND_DOWN", "RANGE_BULL", "RANGE_BEAR",
+    }
+    # Sanity: 4 distinct hex codes.
+    assert len(set(TREND_STATE_COLORS.values())) == 4
+
+
+def test_halved_stage_colors_pins_three_stages():
+    """ADR-0006 pins the 3 HalvedStage colors for the ADX-sub-chart band."""
+    from framework.charts import HALVED_STAGE_COLORS
+
+    assert set(HALVED_STAGE_COLORS) == {"full", "halved", "cleared"}
+    assert len(set(HALVED_STAGE_COLORS.values())) == 3
+
+
+def test_indicator_line_colors_pins_expected_keys():
+    """ADR-0006: MA20 / MA60 / BB upper / mid / lower / +DI / -DI / ADX /
+    RSI each carry a dedicated color so the legend stays readable."""
+    from framework.charts import INDICATOR_LINE_COLORS
+
+    expected = {
+        "MA20", "MA60",
+        "BB_upper", "BB_mid", "BB_lower",
+        "ADX", "plus_di", "minus_di",
+        "RSI",
+    }
+    assert set(INDICATOR_LINE_COLORS) == expected
+    # Every value is a hex string (starts with '#').
+    for k, v in INDICATOR_LINE_COLORS.items():
+        assert v.startswith("#"), f"{k}: {v} is not a hex color"
+
+
+# ---------------------------------------------------------------------------
+# build_indicator_grid (T09 — stock-detail chart, ADR-0006)
+# ---------------------------------------------------------------------------
+
+
+def test_build_indicator_grid_returns_grid_with_kline_adx_rsi_panels(
+    sample_ohlcv,
+):
+    """The new entry point replaces ``build_kline_volume_grid`` for the
+    stock-detail page. Output must be a Grid containing the candlestick
+    and line series for the indicator overlays. Per ADR-0006 the layout
+    is 3 panels (K-line + MA + BB / ADX / RSI); volume is gone
+    (see ADR-0008). The chart owns all indicator computation — the
+    page passes only ``df`` and an optional strategy instance
+    (ADR-0007 single-entry-point contract)."""
+    from framework.charts import build_indicator_grid
+
+    grid = build_indicator_grid(
+        sample_ohlcv,
+        symbol="000001",
+        adj_label="前复权",
+    )
+    assert isinstance(grid, Grid)
+    series_types = {s["type"] for s in grid.options["series"]}
+    # K-line candlestick is still the anchor.
+    assert "candlestick" in series_types, series_types
+    # Indicator overlays are plain ``line`` series (Pyecharts default).
+    assert "line" in series_types, series_types
+    # Three distinct y-axis grid indices: K-line (0), ADX (1), RSI (2).
+    yaxis_indices = {ax.get("gridIndex") for ax in grid.options["yAxis"]}
+    assert {0, 1, 2}.issubset(yaxis_indices), yaxis_indices
+
+
+def test_build_indicator_grid_forwards_buy_sell_to_kline(sample_ohlcv):
+    """MarkPoint forwarding parity with ``build_kline``: signals from
+    the active strategy's ``strategy_suggestions`` still land on the
+    candlestick series after the layout switch. BB-band touches are
+    also on the candlestick MarkPoint list (T09), so we filter by name
+    rather than counting total items."""
+    from framework.charts import build_indicator_grid
+
+    buy = [{"coord": ["2024-01-05", 10.5], "value": "买"}]
+    sell = [{"coord": ["2024-01-50", 14.5], "value": "卖"}]
+    grid = build_indicator_grid(
+        sample_ohlcv,
+        symbol="000001",
+        adj_label="前复权",
+        buy_pts=buy,
+        sell_pts=sell,
+    )
+    kline_series = next(s for s in grid.options["series"] if s["type"] == "candlestick")
+    data = kline_series["markPoint"].opts["data"]
+    names = [it.opts.get("name") for it in data]
+    assert names.count("buy") == 1
+    assert names.count("sell") == 1
+
+
+def test_build_indicator_grid_emits_bb_touch_marks(sample_ohlcv):
+    """Per ADR-0006: Bollinger-band touches get grey-circle MarkPoints on
+    the candlestick series. On the engineered ``sample_ohlcv`` (a
+    monotonic uptrend), there is at least one bar where ``High >= BB
+    upper`` (the trend pushes the close above the upper band)."""
+    from framework.charts import build_indicator_grid
+
+    grid = build_indicator_grid(
+        sample_ohlcv,
+        symbol="000001",
+        adj_label="前复权",
+    )
+    kline_series = next(s for s in grid.options["series"] if s["type"] == "candlestick")
+    data = kline_series["markPoint"].opts["data"]
+    # Each MarkPointItem carries a ``name``; the bb_touch items use
+    # ``name="bb_touch"``.
+    names = [it.opts.get("name") for it in data]
+    assert "bb_touch" in names, names
+
+
+def test_build_indicator_grid_with_adx_bb_instance_renders_state_band(
+    sample_ohlcv,
+):
+    """When ``strategy_instance`` is an ``AdxBbRegimeStrategy`` instance,
+    the chart must consume it and render the TrendState / HalvedStage
+    bands. Pass an actual instance so the duck-typed parameter pull
+    exercises the contract."""
+    from framework.charts import TREND_STATE_COLORS, build_indicator_grid
+    from strategies.adx_bb_regime import AdxBbRegimeStrategy
+
+    inst = AdxBbRegimeStrategy()
+    grid = build_indicator_grid(
+        sample_ohlcv,
+        symbol="000001",
+        adj_label="前复权",
+        strategy_instance=inst,
+    )
+    # If the strategy instance was consumed, the band series names
+    # (TREND_UP / TREND_DOWN / RANGE_BULL / RANGE_BEAR) appear in the
+    # Grid's series list.
+    series_names = []
+    for s in grid.options["series"]:
+        n = s.get("name") if isinstance(s, dict) else None
+        series_names.append(n)
+    state_names = set(TREND_STATE_COLORS)
+    assert state_names.intersection(set(series_names)) == state_names, (
+        f"expected all 4 TrendState band series; got {series_names}"
+    )

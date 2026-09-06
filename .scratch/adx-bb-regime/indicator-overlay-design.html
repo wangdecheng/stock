@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>股票详情页 · ADX+BB 指标叠加 — 技术实现方案</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 1100px;
+    margin: 32px auto;
+    padding: 0 24px;
+    color: #1f2328;
+    background: #ffffff;
+    line-height: 1.65;
+  }
+  h1 { font-size: 28px; margin-bottom: 8px; }
+  h2 { font-size: 22px; margin-top: 40px; border-bottom: 2px solid #eaeaea; padding-bottom: 6px; }
+  h3 { font-size: 17px; margin-top: 24px; }
+  p.subtitle { color: #666; font-size: 15px; margin-top: 0; }
+  pre.mermaid { background: #ffffff; padding: 12px; border: 1px solid #eaeaea; border-radius: 8px; overflow-x: auto; }
+  .diagram-container { margin: 24px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0 24px; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; font-weight: 600; }
+  code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+  pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; }
+  .note {
+    background: #fff8c5;
+    border-left: 4px solid #d4a72c;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .note-red {
+    background: #ffebe9;
+    border-left: 4px solid #cf222e;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .note-green {
+    background: #dafbe1;
+    border-left: 4px solid #1a7f37;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .note-blue {
+    background: #ddf4ff;
+    border-left: 4px solid #0969da;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  /* 强制 Mermaid 图表白底(兼容深色渲染环境) */
+  .mermaid svg { background: #ffffff !important; }
+  .mermaid rect.background { fill: #ffffff !important; }
+</style>
+</head>
+<body>
+
+<h1>股票详情页 · ADX+BB 指标叠加</h1>
+<p class="subtitle">把 StateMachine 的 6 个原始信号 + TrendState/HalvedStage 两条状态色带画到 K 线图上,使「图」与「策略」完全对齐</p>
+
+<div class="note-blue">
+<b>Spec 来源:</b> 本方案由 <code>grill-with-docs</code> 经过 3 轮共 9 个问题收敛得到,所有决策已锁定,无未决项。配套 3 份 ADR:
+<a href="../../../docs/adr/0006-stock-detail-panel-layout-B.md">0006 panel layout B</a> ·
+<a href="../../../docs/adr/0007-state-replay-pure-functions.md">0007 state replay 纯函数</a> ·
+<a href="../../../docs/adr/0008-build-volume-keep-but-deprecate.md">0008 build_volume deprecated</a>。
+</div>
+
+<h2>① 摸清现有服务</h2>
+
+<p>本方案是<strong>已有服务上扩展</strong>,不是新建。所有涉及的模块已经在仓库中:</p>
+
+<table>
+<thead><tr><th>模块</th><th>路径</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td>图表层</td><td><code>framework/charts/__init__.py</code></td><td>Pyecharts + Grid 包装,提供 <code>build_kline / build_volume / build_kline_volume_grid</code></td></tr>
+<tr><td>指标层</td><td><code>framework/indicators/__init__.py</code></td><td>9 个指标(<code>ma / bollinger / rsi / adx</code> 等)的纯 pandas 实现 + 注册表</td></tr>
+<tr><td>策略层</td><td><code>strategies/adx_bb_regime.py</code></td><td><code>AdxBbRegimeStrategy.generate(ctx) → dict[symbol, weight]</code></td></tr>
+<tr><td>页面</td><td><code>pages/1_股票详情.py</code></td><td>Streamlit page,当前调 <code>build_kline_volume_grid</code></td></tr>
+<tr><td>策略加载</td><td><code>framework/persistence</code> + <code>framework/ui_runtime</code></td><td><code>get_active_strategy_id()</code> → 加载策略类 → 构造实例取参数</td></tr>
+</tbody>
+</table>
+
+<p><strong>通信方式:</strong> Streamlit page → 直接调用 <code>framework.charts</code>(同进程);指标由 <code>framework.indicators</code> 直接 <code>import</code> 后调用,不经过 <code>Context</code>。</p>
+<p><strong>无外部服务依赖、无消息队列、无存储新增。</strong></p>
+
+<h2>② 架构设计</h2>
+
+<div class="diagram-container">
+<h3>图1: 模块依赖图</h3>
+<pre class="mermaid">
+graph TB
+  subgraph page["Streamlit Page"]
+    P["pages/1_股票详情.py"]
+  end
+
+  subgraph framework["framework/"]
+    Charts["charts/__init__.py<br/>build_indicator_grid (新)<br/>build_kline / build_volume / build_kline_volume_grid (保留)"]
+    Indics["indicators/__init__.py<br/>ma / bollinger / rsi / adx"]
+    Persist["persistence<br/>get_active_strategy_id / load_strategy_class"]
+    UIRun["ui_runtime<br/>get_connection"]
+  end
+
+  subgraph strategy["strategies/"]
+    ADS["adx_bb_regime.py<br/>_classify / _classify_series (新)<br/>_run_halved_stage_series (新)"]
+  end
+
+  subgraph data["数据获取 (已存在, 本方案不动)"]
+    DA["AKShareAdapter<br/>get_bars / get_fundamentals"]
+  end
+
+  P --> Charts
+  P --> Persist
+  P --> Indics
+  P --> DA
+  Persist --> UIRun
+  Persist --> ADS
+  Charts --> Indics
+  Charts -. "状态色带纯函数" .-> ADS
+</pre>
+<div class="note-green">
+<b>设计亮点:</b> <code>framework.charts</code> 成为图表渲染的<b>唯一入口</code>,<code>pages/1_股票详情.py</code> 不直接调 <code>strategies.adx_bb_regime</code> —— 策略层只暴露「状态回放」的纯函数,图表层负责把所有渲染细节(K 线 / 指标线 / 色带 / MarkPoint)拼成一个 Grid。
+</div>
+</div>
+
+<h2>③ 数据模型</h2>
+
+<p>本方案<strong>不新增任何数据库表或持久化文件</strong>。所有数据流都是「内存里的 pd.DataFrame / pd.Series」在 Streamlit 单次 render 内完成。色带不需要落盘 —— 重渲染时由纯函数重新计算。</p>
+
+<table>
+<thead><tr><th>变量名</th><th>类型</th><th>来源</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>df</code></td><td><code>pd.DataFrame</code> (OHLCV)</td><td><code>AKShareAdapter.get_bars</code></td><td>K 线主图 + 所有指标输入</td></tr>
+<tr><td><code>ma20 / ma60</code></td><td><code>pd.Series</code></td><td><code>indicators.ma(df, 20/60)</code></td><td>主图叠加线 + D3 cascade 输入</td></tr>
+<tr><td><code>bb_df</code></td><td><code>pd.DataFrame{lower, mid, upper}</code></td><td><code>indicators.bollinger(df, 20, 2.0)</code></td><td>主图 BB 三轨 + 触线 MarkPoint</td></tr>
+<tr><td><code>adx_df</code></td><td><code>pd.DataFrame{adx, plus_di, minus_di}</code></td><td><code>indicators.adx(df, 14)</code></td><td>ADX 副图三线 + D3 cascade 输入</td></tr>
+<tr><td><code>rsi_series</code></td><td><code>pd.Series</code></td><td><code>indicators.rsi(df, 14)</code></td><td>RSI 副图单线 + Signal Modulator 输入(本图不画)</td></tr>
+<tr><td><code>state_series</code></td><td><code>pd.Series[str]</code></td><td><code>AdxBbRegimeStrategy._classify_series</code> (新)</td><td>TrendState 4 色带</td></tr>
+<tr><td><code>stage_series</code></td><td><code>pd.Series[str]</code></td><td><code>AdxBbRegimeStrategy._run_halved_stage_series</code> (新)</td><td>HalvedStage 3 色带</td></tr>
+</tbody>
+</table>
+
+<h2>④ 序列图</h2>
+
+<div class="diagram-container">
+<h3>图2: 股票详情页 render 一次完整数据流</h3>
+<pre class="mermaid">
+sequenceDiagram
+  autonumber
+  actor U as 用户
+  participant P as pages/1_股票详情.py
+  participant A as AKShareAdapter
+  participant Persist as framework.persistence
+  participant Strat as AdxBbRegimeStrategy 实例
+  participant Indics as framework.indicators
+  participant Charts as framework.charts<br/>build_indicator_grid
+
+  U->>P: 输入 symbol / 时间范围 / 复权,点「查询」
+  P->>A: get_bars(symbol, start, end, adj)
+  A-->>P: BarsResult(df, source, stale_seconds)
+  P->>Persist: get_active_strategy_id()
+  Persist-->>P: strategy_id (e.g. "adx_bb_regime")
+  P->>Strat: load + construct(strategy_id)
+  Strat-->>P: 实例 + 参数 (adx_len=14, bb_len=20, bb_std=2.0, rsi_len=14)
+  P->>Indics: ma(df, 20/60), bollinger(df, 20, 2.0), adx(df, 14), rsi(df, 14)
+  Indics-->>P: 4 个 indicator DataFrame/Series
+  P->>Strat: _classify_series(df, adx_df, ma20, ma60)
+  P->>Strat: _run_halved_stage_series(close, ma10, ma20)
+  Strat-->>P: state_series / stage_series
+  P->>Persist: list_suggestions(active_strategy, applied=True)
+  Persist-->>P: 历史 buy/sell signal
+  P->>Charts: build_indicator_grid(df, indicators, state_series, stage_series, buy/sell_pts, symbol, adj_label)
+  Charts-->>P: Pyecharts Grid
+  P-->>U: st_pyecharts(Grid, height="800px")
+</pre>
+<div class="note-blue">
+<b>关键:</b> 步骤 7-9(指标计算)+ 10-11(状态回放)是<strong>同步纯函数</strong>,加进 render 后单次成本约 <code>~30ms</code>(60 根 bar),不阻塞 UI。
+</div>
+</div>
+
+<div class="diagram-container">
+<h3>图3: 历史状态回放 — 纯函数版本与 generate() 的对照</h3>
+<pre class="mermaid">
+flowchart TD
+  Start([每根历史 bar i])
+  Start --> Pull["取 df.iloc[i] + adx_df.iloc[i]<br/>+ ma20.iloc[i] + ma60.iloc[i]"]
+  Pull --> Classify["_classify(adx, +di, -di, close, ma20, ma60)<br/>→ 'TREND_UP' | 'TREND_DOWN' | 'RANGE_BULL' | 'RANGE_BEAR'"]
+  Classify --> StateSeries["state_series[i] = result"]
+  StateSeries --> StageLoop{i 在 TREND_UP 范围内?}
+  StageLoop -- 是 --> Stage["三阶段机:<br/>stage[i] = full → (close<ma20) halved → (close<ma10) cleared"]
+  StageLoop -- 否 --> StageDefault["stage[i] = 'n/a' (色带不画)"]
+  StageDefault --> Next
+  Stage --> Next([i += 1])
+  Next --> Start
+
+  classDef pure fill:#dafbe1,stroke:#1a7f37
+  class Pull,Classify,StateSeries,Stage,StageDefault pure
+</pre>
+<div class="note-green">
+<b>设计意图:</b> 纯函数路径与 <code>AdxBbRegimeStrategy.generate()</code> 中的 D3 cascade + T04 三阶段机<strong>数学上等价</strong>,但无 <code>ctx.state</code> 副作用、无 Phased Exit 中间态污染。parity test 锁定这个不变量。
+</div>
+</div>
+
+<h2>⑤ 安全设计</h2>
+
+<p>本方案是<strong>纯前端渲染层</strong>的扩展,无新接口、无新表、无新缓存、无新鉴权点。安全审查项目:</p>
+
+<table>
+<thead><tr><th>类别</th><th>检查</th><th>结论</th></tr></thead>
+<tbody>
+<tr><td>输入校验</td><td>用户输入 symbol / 时间范围</td><td>已由既有 <code>_fetch_bars_cached</code> 处理(<code>EmptyBarsError / UnknownSymbolError / DataAdapterUnavailable / RateLimitExceeded</code>),本方案不引入新输入</td></tr>
+<tr><td>存储安全</td><td>无新写入路径</td><td>N/A —— 全部内存计算,色带不持久化</td></tr>
+<tr><td>访问控制</td><td>无新接口</td><td>N/A —— 仍是单用户本地 Streamlit</td></tr>
+<tr><td>传输安全</td><td>无新增网络</td><td>N/A —— 沿用既有 AKShare adapter 链路</td></tr>
+<tr><td>并发 / 资源</td><td>每根 bar 4 个指标 + 1 个回放</td><td>60 根 bar 单次 render <code>~30ms</code>,Streamlit rerun 触发频率无变化(form gate 已就位)</td></tr>
+<tr><td>副作用隔离</td><td>历史回放函数必须<strong>不写</strong> <code>ctx.state</code></td><td>由 API 设计保证(纯函数 <code>df → Series</code>),且 parity test 跑在隔离的 fake Context 上不会污染</td></tr>
+</tbody>
+</table>
+
+<div class="note">
+<b>注意 (非安全风险,是设计约束):</b> 历史回放必须严格用 <strong>「按日闭式」</strong>假设(<code>close_t</code> 已知,推算 <code>state_t</code>),不允许偷看未来 bar。本方案的 <code>_classify_series</code> 内部只用 <code>iloc[i]</code> 截面的指标值,不存在 look-ahead bias;parity test 用一段真实 60-bar 历史跑回归,确认无未来信息泄漏。
+</div>
+
+<h2>⑥ 接口清单</h2>
+
+<p>本方案<strong>无新增 REST / RPC / DB 接口</strong>。只新增 3 个 Python 函数 + 1 个 Grid 构造器:</p>
+
+<table>
+<thead><tr><th>名称</th><th>签名</th><th>位置</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>AdxBbRegimeStrategy._classify_series</code></td><td><code>(df, adx_df, ma20, ma60) -&gt; pd.Series[str]</code></td><td><code>strategies/adx_bb_regime.py</code></td><td>逐 bar 跑 D3 cascade,产 TrendState 序列</td></tr>
+<tr><td><code>AdxBbRegimeStrategy._run_halved_stage_series</code></td><td><code>(close, ma10, ma20, initial_stage='full') -&gt; pd.Series[str]</code></td><td>同上</td><td>逐 bar 跑 T04 三阶段机,产 HalvedStage 序列</td></tr>
+<tr><td><code>build_indicator_grid</code></td><td><code>(df, *, symbol, adj_label, ma20, ma60, bb_df, adx_df, rsi_series, state_series, stage_series, buy_pts, sell_pts, hold_pts) -&gt; Grid</code></td><td><code>framework/charts/__init__.py</code></td><td>股票详情页的新入口</td></tr>
+<tr><td>常量组 <code>TREND_STATE_COLORS / HALVED_STAGE_COLORS / INDICATOR_LINE_COLORS</code></td><td><code>dict[str, str]</code></td><td><code>framework/charts/__init__.py</code> 顶部</td><td>色值集中,跟既有 <code>A_SHARE_UP_COLOR</code> 同款</td></tr>
+</tbody>
+</table>
+
+<h2>⑦ 落盘与执行步骤</h2>
+
+<table>
+<thead><tr><th>步骤</th><th>文件</th><th>动作</th><th>验证</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><code>strategies/adx_bb_regime.py</code></td><td>新增 <code>_classify_series</code> + <code>_run_halved_stage_series</code> 纯函数,带 docstring</td><td>单元测试</td></tr>
+<tr><td>2</td><td><code>tests/test_adx_bb_regime_state_replay.py</code>(新)</td><td>parity test: <code>_classify_series</code> 跟 <code>generate()</code> 逐 bar 比对;halved stage 三阶段切换;warmup NaN 处理</td><td>pytest 全绿</td></tr>
+<tr><td>3</td><td><code>framework/charts/__init__.py</code></td><td>新增色值常量 + <code>build_indicator_grid</code>;给 <code>build_volume</code> docstring 加 Deprecated 标记</td><td>现有 <code>test_charts.py</code> 全绿</td></tr>
+<tr><td>4</td><td><code>tests/test_charts.py</code>(扩)</td><td>新增 <code>test_build_indicator_grid_*</code>:常量存在、Grid 三 panel、legend 顺序、参考线颜色</td><td>pytest 全绿</td></tr>
+<tr><td>5</td><td><code>pages/1_股票详情.py</code></td><td>从 <code>build_kline_volume_grid</code> 切到 <code>build_indicator_grid</code>;从 <code>framework.persistence</code> 加载激活策略取参数;调 <code>_classify_series</code> / <code>_run_halved_stage_series</code> 拿色带数据</td><td>手动 streamlit run 验证</td></tr>
+<tr><td>6</td><td>(验收)</td><td>在浏览器打开股票详情页,确认:K 线 + MA20/60 + BB 通道叠加;ADX 三线 + 阈值线;RSI 单线 + 30 阈值;TrendState 色带随日期切换;HalvedStage 色带在 ADX 副图下方</td><td>人工目检 + 截图</td></tr>
+</tbody>
+</table>
+
+<h2>⚠️ 待明确事项</h2>
+
+<div class="note">
+<b>无。</b> 本方案的所有决策在 grill 阶段已收敛,3 份 ADR 已落地,无未决项。后续如果在实施中发现新约束(如 Streamlit rerun 性能、Pyecharts 色带 API 限制),回到本文件追加 ADR,不动主设计。
+</div>
+
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'default', securityLevel: 'loose', flowchart: { useMaxWidth: true } });
+</script>
+
+</body>
+</html>
