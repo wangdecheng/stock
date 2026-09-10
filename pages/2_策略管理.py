@@ -43,7 +43,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("⚙️ 策略管理")
+st.markdown("#### ⚙️ 策略管理")
 st.caption("discover + 参数编辑 + 激活 + 最近回测记录")
 
 

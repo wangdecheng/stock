@@ -63,7 +63,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("💼 持仓管理")
+st.markdown("#### 💼 持仓管理")
 st.caption("真实成交录入 + 虚拟账本快照(由 T4 持久化)")
 
 

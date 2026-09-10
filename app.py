@@ -58,7 +58,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📈 A 股量化 · 仪表盘")
+st.markdown("#### 📈 A 股量化 · 仪表盘")
 st.caption(f"今天 {date.today().isoformat()} · 持仓概览 + 今日操作计划")
 
 

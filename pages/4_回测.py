@@ -48,7 +48,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("📈 回测")
+st.markdown("#### 📈 回测")
 st.caption("策略 + 时间窗口 + 初始现金 → PnL + 7 个指标")
 
 

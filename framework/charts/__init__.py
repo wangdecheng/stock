@@ -513,8 +513,11 @@ def build_indicator_grid(
         )
     )
 
-    # MA20 + MA60 line series — overlaid on the K-line axis (grid_index=0).
-    ma20_line = (
+    # MA20 + MA60 + BB upper/mid/lower all live on the SAME Line chart
+    # so a single ``grid.add()`` places the entire K-line panel cleanly.
+    # Mixing series on one chart lets Pyecharts render them in z-order
+    # and share a single legend / tooltip / datazoom.
+    kline_overlay = (
         Line()
         .add_xaxis(dates)
         .add_yaxis(
@@ -527,10 +530,6 @@ def build_indicator_grid(
                 color=INDICATOR_LINE_COLORS["MA20"], width=1
             ),
         )
-    )
-    ma60_line = (
-        Line()
-        .add_xaxis(dates)
         .add_yaxis(
             "MA60",
             ma60.tolist(),
@@ -541,10 +540,6 @@ def build_indicator_grid(
                 color=INDICATOR_LINE_COLORS["MA60"], width=1
             ),
         )
-    )
-    bb_upper_line = (
-        Line()
-        .add_xaxis(dates)
         .add_yaxis(
             "BB_upper",
             bb_df["upper"].tolist(),
@@ -555,10 +550,6 @@ def build_indicator_grid(
                 color=INDICATOR_LINE_COLORS["BB_upper"], width=1, type_="dashed"
             ),
         )
-    )
-    bb_mid_line = (
-        Line()
-        .add_xaxis(dates)
         .add_yaxis(
             "BB_mid",
             bb_df["mid"].tolist(),
@@ -569,10 +560,6 @@ def build_indicator_grid(
                 color=INDICATOR_LINE_COLORS["BB_mid"], width=1
             ),
         )
-    )
-    bb_lower_line = (
-        Line()
-        .add_xaxis(dates)
         .add_yaxis(
             "BB_lower",
             bb_df["lower"].tolist(),
@@ -585,36 +572,30 @@ def build_indicator_grid(
         )
     )
 
-    # TrendState background band — one Bar series per state, stacked
-    # at a fixed height; only the relevant state has the volume value
-    # at each bar, others are 0. Pyecharts Bar stack renders this as
-    # a thin colored strip behind the K-line.
-    state_to_color = TREND_STATE_COLORS
-    state_strips: list[Bar] = []
-    for state_name, color in state_to_color.items():
+    # TrendState background band — one Bar chart with 4 stacked
+    # ``add_yaxis`` calls (one per state). All share ``stack="..."``
+    # so they render as a continuous thin strip behind the K-line.
+    state_band = (
+        Bar()
+        .add_xaxis(dates)
+    )
+    for state_name, color in TREND_STATE_COLORS.items():
         heights = [
             1.0 if s == state_name else 0.0 for s in state_series.tolist()
         ]
-        strip = (
-            Bar()
-            .add_xaxis(dates)
-            .add_yaxis(
-                state_name,
-                heights,
-                xaxis_index=0,
-                yaxis_index=0,
-                stack="trend_state_band",
-                itemstyle_opts=opts.ItemStyleOpts(color=color, opacity=0.35),
-                label_opts=opts.LabelOpts(is_show=False),
-            )
-            .set_global_opts(
-                xaxis_opts=opts.AxisOpts(
-                    type_="category", grid_index=0, is_show=False
-                ),
-                yaxis_opts=opts.AxisOpts(grid_index=0, is_show=False),
-            )
+        state_band = state_band.add_yaxis(
+            state_name,
+            heights,
+            xaxis_index=0,
+            yaxis_index=0,
+            stack="trend_state_band",
+            itemstyle_opts=opts.ItemStyleOpts(color=color, opacity=0.35),
+            label_opts=opts.LabelOpts(is_show=False),
         )
-        state_strips.append(strip)
+    state_band = state_band.set_global_opts(
+        xaxis_opts=opts.AxisOpts(type_="category", grid_index=0, is_show=False),
+        yaxis_opts=opts.AxisOpts(grid_index=0, is_show=False),
+    )
 
     # ----- Panel 1: ADX (+DI / -DI / ADX) + HalvedStage band -------------
 
@@ -670,32 +651,29 @@ def build_indicator_grid(
         )
     )
 
-    # HalvedStage band — same stack pattern as TrendState, on the ADX axis.
-    stage_strips: list[Bar] = []
+    # HalvedStage band on the ADX axis — same single-Bar + multi-add_yaxis
+    # pattern as TrendState.
+    stage_band = (
+        Bar()
+        .add_xaxis(dates)
+    )
     for stage_name, color in HALVED_STAGE_COLORS.items():
         heights = [
             1.0 if s == stage_name else 0.0 for s in stage_series.tolist()
         ]
-        strip = (
-            Bar()
-            .add_xaxis(dates)
-            .add_yaxis(
-                stage_name,
-                heights,
-                xaxis_index=1,
-                yaxis_index=1,
-                stack="halved_stage_band",
-                itemstyle_opts=opts.ItemStyleOpts(color=color, opacity=0.45),
-                label_opts=opts.LabelOpts(is_show=False),
-            )
-            .set_global_opts(
-                xaxis_opts=opts.AxisOpts(
-                    type_="category", grid_index=1, is_show=False
-                ),
-                yaxis_opts=opts.AxisOpts(grid_index=1, is_show=False),
-            )
+        stage_band = stage_band.add_yaxis(
+            stage_name,
+            heights,
+            xaxis_index=1,
+            yaxis_index=1,
+            stack="halved_stage_band",
+            itemstyle_opts=opts.ItemStyleOpts(color=color, opacity=0.45),
+            label_opts=opts.LabelOpts(is_show=False),
         )
-        stage_strips.append(strip)
+    stage_band = stage_band.set_global_opts(
+        xaxis_opts=opts.AxisOpts(type_="category", grid_index=1, is_show=False),
+        yaxis_opts=opts.AxisOpts(grid_index=1, is_show=False),
+    )
 
     # ----- Panel 2: RSI ----------------------------------------------------
 
@@ -729,71 +707,49 @@ def build_indicator_grid(
     )
 
     # ----- Grid assembly ---------------------------------------------------
+    #
+    # One ``add()`` per panel. K-line panel = K-line candlestick + overlay
+    # Line (MA + BB) + state band Bar. ADX panel = ADX Line + stage band
+    # Bar. RSI panel = RSI Line. Total: 5 ``add()`` calls instead of 14,
+    # and each panel's grid_opts is declared exactly once.
 
     grid = Grid(init_opts=opts.InitOpts(width="100%", height=total_height))
-    # Main K-line panel (top).
+
+    # Panel 0 — K-line (top, 8%-58%, ~50% height).
     grid.add(
         kline,
         grid_opts=opts.GridOpts(
             pos_left="8%", pos_right="4%", pos_top="8%", height="50%",
         ),
     )
-    # Overlay MA + BB lines on the same panel — Pyecharts lets multiple
-    # chart objects share a grid via ``grid_index``.
     grid.add(
-        ma20_line,
+        kline_overlay,
         grid_opts=opts.GridOpts(
             pos_left="8%", pos_right="4%", pos_top="8%", height="50%",
         ),
     )
     grid.add(
-        ma60_line,
+        state_band,
         grid_opts=opts.GridOpts(
             pos_left="8%", pos_right="4%", pos_top="8%", height="50%",
         ),
     )
-    grid.add(
-        bb_upper_line,
-        grid_opts=opts.GridOpts(
-            pos_left="8%", pos_right="4%", pos_top="8%", height="50%",
-        ),
-    )
-    grid.add(
-        bb_mid_line,
-        grid_opts=opts.GridOpts(
-            pos_left="8%", pos_right="4%", pos_top="8%", height="50%",
-        ),
-    )
-    grid.add(
-        bb_lower_line,
-        grid_opts=opts.GridOpts(
-            pos_left="8%", pos_right="4%", pos_top="8%", height="50%",
-        ),
-    )
-    for strip in state_strips:
-        grid.add(
-            strip,
-            grid_opts=opts.GridOpts(
-                pos_left="8%", pos_right="4%", pos_top="8%", height="50%",
-            ),
-        )
 
-    # ADX panel (middle).
+    # Panel 1 — ADX (62%-82%, ~20% height).
     grid.add(
         adx_chart,
         grid_opts=opts.GridOpts(
             pos_left="8%", pos_right="4%", pos_top="62%", height="20%",
         ),
     )
-    for strip in stage_strips:
-        grid.add(
-            strip,
-            grid_opts=opts.GridOpts(
-                pos_left="8%", pos_right="4%", pos_top="62%", height="20%",
-            ),
-        )
+    grid.add(
+        stage_band,
+        grid_opts=opts.GridOpts(
+            pos_left="8%", pos_right="4%", pos_top="62%", height="20%",
+        ),
+    )
 
-    # RSI panel (bottom).
+    # Panel 2 — RSI (84%-98%, ~14% height).
     grid.add(
         rsi_chart,
         grid_opts=opts.GridOpts(
